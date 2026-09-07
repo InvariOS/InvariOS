@@ -1,0 +1,20 @@
+/bin
+# Downloaded upstream artifacts
+/downloads/
+
+# Intermediate build artifacts
+/build/
+
+# Final generated images
+/out/
+
+# Dev-only QEMU firmware cache (see `make ovmf`)
+/.ovmf/
+
+# macOS
+.DS_Store
+
+# Editor cruft
+*.swp
+*.swo
+*~
