@@ -25,6 +25,11 @@ var virtualFilesystems = []virtualFilesystem{
 	{source: "proc", target: "/proc", fstype: "proc"},
 	{source: "sysfs", target: "/sys", fstype: "sysfs"},
 	{source: "devtmpfs", target: "/dev", fstype: "devtmpfs"},
+	// efivarfs must come after sysfs (it mounts under /sys/firmware/efi).
+	// internal/efi reads/writes EFI variables through it directly, and
+	// go-blockdevice/foxboron/go-uefi both expect it to already be
+	// mounted rather than mounting it themselves.
+	{source: "efivarfs", target: "/sys/firmware/efi/efivars", fstype: "efivarfs"},
 }
 
 // VirtualFilesystems mounts proc, sysfs, and devtmpfs. It returns the

@@ -59,6 +59,7 @@ const espImageSize = 128 << 20 // 128 MiB
 var (
 	buildKernelImage      string
 	buildSystemdBootImage string
+	buildFsutilsImage     string
 	buildOpenBaoVersion   string
 	buildRoot             string
 )
@@ -80,6 +81,7 @@ func init() {
 	buildCmd.Flags().StringVar(&buildRoot, "root", ".", "Repository root.")
 	buildCmd.Flags().StringVar(&buildKernelImage, "kernel-image", "ghcr.io/invarios/pkgs/kernel:6.18.49-amd64", "OCI image to pull the kernel from.")
 	buildCmd.Flags().StringVar(&buildSystemdBootImage, "systemd-boot-image", "ghcr.io/invarios/pkgs/systemd-boot:261.2-amd64", "OCI image to pull systemd-boot from.")
+	buildCmd.Flags().StringVar(&buildFsutilsImage, "fsutils-image", "ghcr.io/invarios/pkgs/fsutils:main", "OCI image to pull mkfs.vfat/mkfs.xfs from.")
 	buildCmd.Flags().StringVar(&buildOpenBaoVersion, "openbao-version", "2.6.2", "OpenBao release version to bundle.")
 
 	rootCmd.AddCommand(buildCmd)
@@ -136,6 +138,10 @@ func runBuild(ctx context.Context) error {
 
 	if err := installKernel(ctx, layout); err != nil {
 		return fmt.Errorf("installing kernel: %w", err)
+	}
+
+	if err := installFsutils(ctx, layout); err != nil {
+		return fmt.Errorf("installing fsutils: %w", err)
 	}
 
 	sdbootDir, err := installSystemdBoot(ctx, layout)
@@ -342,6 +348,25 @@ func installKernel(ctx context.Context, layout buildLayout) error {
 	}
 
 	return copyFile(filepath.Join(kernelDir, "kernel.config"), filepath.Join(layout.out, "kernel.config"), 0o644)
+}
+
+// installFsutils pulls buildFsutilsImage and extracts it straight into
+// the staged rootfs. That image (invarios-pkgs/fsutils) is itself
+// already laid out at the exact paths its contents need to live at in
+// the appliance (/sbin/mkfs.vfat, /sbin/mkfs.xfs, and the Alpine musl +
+// shared libraries they're dynamically linked against), so no
+// per-file copying/renaming is needed the way installKernel and
+// installSystemdBoot do.
+//
+// This is a deliberate, temporary shortcut: everything else this
+// command builds is compiled from verified upstream source, but these
+// two binaries are not. See invarios-pkgs/fsutils/Dockerfile's own top
+// comment for what trust boundary it relies on instead, and what
+// replacing it with a from-source build would look like.
+func installFsutils(ctx context.Context, layout buildLayout) error {
+	logStep("installing prebuilt fsutils (mkfs.vfat/mkfs.xfs)")
+
+	return ociimage.PullAndExtract(ctx, buildFsutilsImage, buildArch, layout.rootfs)
 }
 
 // installSystemdBoot pulls buildSystemdBootImage and returns the

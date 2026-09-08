@@ -62,17 +62,36 @@ ovmf:
 		apt-get install -y -qq --no-install-recommends ovmf >/dev/null && \
 		cp /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_VARS_4M.fd /out/'
 
+# Size `make boot`'s throwaway test disk is grown to before booting it.
+# out/invarios-efi.img itself (espImageSize in cmd/build.go) only needs
+# to hold systemd-boot + one UKI + loader.conf (~128 MiB) -- real
+# installer media (a USB stick, an ISO's El Torito image) installs onto
+# a *separate* target disk, so it never needs to be bigger than that.
+# `make boot`'s self-install-in-place loop is the one case where the
+# boot media and the install target are the same file, so it alone
+# needs headroom for the post-install GPT layout (ESP+META+STATE+DATA,
+# sized in internal/disk) to fit once Install repartitions it.
+BOOT_DISK_SIZE := 2G
+BOOT_DISK := /tmp/invarios-boot-disk.img
+
 # Quick local boot test: serial-only, no Proxmox/USB copy required.
-# Re-copies OVMF_VARS each run so NVRAM state (boot attempts, etc.)
-# never carries over between test boots.
+# Re-copies OVMF_VARS and the boot disk each run so NVRAM state (boot
+# attempts, the Boot#### entry Install creates, etc.) and any previous
+# install never carry over between separate `make boot` invocations --
+# within a single run, the same disk and OVMF vars persist across
+# invarios's own internal reboot (install, then straight into boot),
+# since that reboot restarts the guest kernel without qemu itself
+# exiting.
 boot: $(OVMF_CODE)
 	cp $(OVMF_VARS) /tmp/invarios-ovmf-vars.fd
+	cp out/invarios-efi.img $(BOOT_DISK)
+	truncate -s $(BOOT_DISK_SIZE) $(BOOT_DISK)
 	qemu-system-x86_64 \
 		-machine q35,accel=tcg \
 		-m 1G \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=/tmp/invarios-ovmf-vars.fd \
-		-drive if=none,format=raw,file=out/invarios-efi.img,id=bootdisk \
+		-drive if=none,format=raw,file=$(BOOT_DISK),id=bootdisk \
 		-device virtio-blk-pci,drive=bootdisk,bootindex=1 \
 		-device virtio-rng-pci \
 		-netdev user,id=net0,hostfwd=tcp::8200-:8200 \

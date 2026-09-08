@@ -9,9 +9,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/invarios/invarios/internal/console"
+	"github.com/invarios/invarios/internal/install"
 	"github.com/invarios/invarios/internal/mount"
 	"github.com/invarios/invarios/internal/network"
-	"github.com/invarios/invarios/internal/supervise"
 	"github.com/invarios/invarios/internal/version"
 )
 
@@ -20,54 +20,88 @@ var rootCmd = &cobra.Command{
 	Use:   "invarios",
 	Short: "An immutable operating system for OpenBao.",
 	Run: func(_ *cobra.Command, _ []string) {
-		if err := mount.VirtualFilesystems(); err != nil {
-			fmt.Println("[init] fatal:", err)
-			os.Exit(1)
-		}
-
-		console.Setup()
-
-		fmt.Println()
-		fmt.Println("========================================")
-		fmt.Println("                InvariOS                ")
-		fmt.Println("========================================")
-		fmt.Println(version.Short())
-		fmt.Println()
-
-		if kernelVersion, err := os.ReadFile("/proc/version"); err == nil {
-			fmt.Print(string(kernelVersion))
-		}
+		runInitialize()
 
 		ctx := context.Background()
 
-		if err := network.Up(ctx, "eth0"); err != nil {
-			fmt.Println("[net] error:", err)
+		installed, diskPath, err := install.Detect()
+		if err != nil {
+			console.Fatal("[install] detecting install state:", err)
 		}
 
-		if child, err := supervise.StartOpenBao(ctx); err != nil {
-			fmt.Println("[openbao] failed to start:", err)
-		} else {
-			go func() {
-				fmt.Println("[openbao] exited:", child.Wait())
-			}()
+		if !installed {
+			runInstall(ctx, diskPath)
+
+			return // Unreachable: runInstall reboots or hangs in console.Fatal.
 		}
 
-		fmt.Println("Go supervisor successfully started...")
-		for {
-			time.Sleep(1 * time.Second)
-		}
+		runBoot(ctx)
 	},
+}
+
+// runInitialize brings up the pseudo-filesystems (including efivarfs,
+// needed by both Install and Boot below) and the console, and prints
+// the startup banner. This step runs unconditionally, before it's known
+// whether the machine still needs installing.
+func runInitialize() {
+	if err := mount.VirtualFilesystems(); err != nil {
+		// console.Setup hasn't run yet at this point, so console.Fatal
+		// falls back to its plain os.Stdout path -- still correct here,
+		// since stdout is still exactly what the kernel bound it to.
+		console.Fatal("[init] fatal:", err)
+	}
+
+	console.Setup()
+
+	fmt.Println()
+	fmt.Println("========================================")
+	fmt.Println("                InvariOS                ")
+	fmt.Println("========================================")
+	fmt.Println(version.Short())
+	fmt.Println()
+
+	if kernelVersion, err := os.ReadFile("/proc/version"); err == nil {
+		fmt.Print(string(kernelVersion))
+	}
+}
+
+// runInstall installs invarios onto diskPath and reboots. It does not
+// return on success: install.Run's own success path ends in
+// unix.Reboot, which hands control back to the firmware. Only the
+// failure path returns here, and that's fatal -- there's no disk to
+// boot from yet to fall back to.
+func runInstall(ctx context.Context, diskPath string) {
+	if err := install.Run(ctx, diskPath); err != nil {
+		console.Fatal("[install] fatal:", err)
+	}
+}
+
+// runBoot is what an already-installed system falls through to: bring
+// up networking and enter the supervise loop. It does not start OpenBao
+// -- every boot into an installed system requires an explicit bootstrap
+// decision first (single-node/dev is a bootstrap mode, not a default
+// that bypasses bootstrap), and there is no bootstrap mechanism yet
+// (that's the Management API phase). internal/supervise.StartOpenBao
+// is unused for now, left in place for whatever the bootstrap path
+// calls once it exists.
+func runBoot(ctx context.Context) {
+	if err := network.Up(ctx, "eth0"); err != nil {
+		fmt.Println("[net] error:", err)
+	}
+
+	fmt.Println("[bao] awaiting bootstrap (no bootstrap mechanism yet)")
+
+	fmt.Println("Go supervisor successfully started...")
+
+	for {
+		time.Sleep(1 * time.Second)
+	}
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
-	err := rootCmd.Execute()
-	if err != nil {
-		os.Exit(1)
+	if err := rootCmd.Execute(); err != nil {
+		console.Fatal(err)
 	}
-}
-
-func init() {
-
 }
