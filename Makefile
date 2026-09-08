@@ -1,34 +1,100 @@
-MODULE   = $(shell $(GO) list -m)
-DATE    ?= $(shell date +%FT%T%z)
-PKGS     = $(or $(PKG),$(shell $(GO) list ./...))
-TESTPKGS = $(shell $(GO) list -f \
-			'{{ if or .TestGoFiles .XTestGoFiles }}{{ .ImportPath }}{{ end }}' \
-			$(PKGS))
-BIN      = $(CURDIR)/bin
+GO       := go
+GOOS     ?= linux
+GOARCH   ?= amd64
+PKGS      = $(or $(PKG),$(shell $(GO) list ./...))
+BIN       = $(CURDIR)/bin
+V         = 0
+Q         = $(if $(filter 1,$V),,@)
+M         = $(shell printf "\033[34;1m▶\033[0m")
 
-GO      = go
-GOOS    ?= linux
-GOARCH  ?= amd64
-TIMEOUT = 15
-V = 0
-Q = $(if $(filter 1,$V),,@)
-M = $(shell printf "\033[34;1m▶\033[0m")
+IMAGE := invarios-builder
+PLATFORM := $(GOOS)/$(GOARCH)
+KERNEL_IMAGE := ghcr.io/invarios/pkgs/kernel:6.18.49-amd64
+SYSTEMD_BOOT_IMAGE := ghcr.io/invarios/pkgs/systemd-boot:261.2-amd64
+OPENBAO_VERSION := 2.6.2
+OVMF_DIR := .ovmf
+OVMF_CODE := $(OVMF_DIR)/OVMF_CODE_4M.fd
+OVMF_VARS := $(OVMF_DIR)/OVMF_VARS_4M.fd
 
-binext=""
-ifeq ($(GOOS),windows)
-  binext=".exe"
+# The build depends on Linux-only tooling (makefs.VFAT shells out to
+# mkfs.vfat/mcopy). On Linux it can therefore run directly on the host;
+# everywhere else it needs the builder container. DOCKER=true forces
+# the container path on Linux too.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+DOCKER ?= false
+else
+DOCKER ?= true
 endif
 
-.PHONY: all
-all: fmt lint build
+ifeq ($(DOCKER),true)
+docker-run = docker run --rm --platform $(PLATFORM) -v "$(CURDIR):/work" $(IMAGE)
+else
+docker-run =
+endif
 
-.PHONY: build
-build: $(BIN) ; $(info $(M) building executable…) @ ## Build program binary
-	$Q CGO_ENABLED=0 $(GO) build \
-		-ldflags "-X main.gitVersion=$$(git describe --tags) -X $(MODULE)/cmd.gitVersion=$$(git describe --tags) -X \"main.buildTime=$$(date -u '+%Y-%m-%d %H:%M:%S %Z')\" -X \"$(MODULE)/cmd.buildTime=$$(date -u '+%Y-%m-%d %H:%M:%S %Z')\"" \
-		-tags release \
-		-o $(BIN)/$(notdir $(basename $(MODULE)))$(binext)
-# Tools
+.PHONY: image build shell clean ovmf boot fmt lint vulncheck
+
+image:
+	docker build \
+		--platform $(PLATFORM) \
+		-t $(IMAGE) \
+		.
+
+build: $(if $(filter true,$(DOCKER)),image)
+	$(docker-run) go run . build \
+		--kernel-image=$(KERNEL_IMAGE) \
+		--systemd-boot-image=$(SYSTEMD_BOOT_IMAGE) \
+		--openbao-version=$(OPENBAO_VERSION)
+
+shell: image
+	docker run --rm -it \
+		--platform $(PLATFORM) \
+		-v "$(CURDIR):/work" \
+		$(IMAGE) \
+		bash
+
+# Fetches a fresh OVMF (UEFI firmware for QEMU) from Debian, cached
+# under .ovmf/. Not part of the shipped appliance; this is dev-only
+# tooling so local `make boot` doesn't depend on whatever OVMF vintage
+# happens to be bundled with the host's qemu install.
+ovmf:
+	mkdir -p $(OVMF_DIR)
+	docker run --rm -v "$(CURDIR)/$(OVMF_DIR):/out" debian:trixie bash -c '\
+		apt-get update -qq && \
+		apt-get install -y -qq --no-install-recommends ovmf >/dev/null && \
+		cp /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_VARS_4M.fd /out/'
+
+# Quick local boot test: serial-only, no Proxmox/USB copy required.
+# Re-copies OVMF_VARS each run so NVRAM state (boot attempts, etc.)
+# never carries over between test boots.
+boot: $(OVMF_CODE)
+	cp $(OVMF_VARS) /tmp/invarios-ovmf-vars.fd
+	qemu-system-x86_64 \
+		-machine q35,accel=tcg \
+		-m 1G \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive if=pflash,format=raw,file=/tmp/invarios-ovmf-vars.fd \
+		-drive if=none,format=raw,file=out/invarios-efi.img,id=bootdisk \
+		-device virtio-blk-pci,drive=bootdisk,bootindex=1 \
+		-device virtio-rng-pci \
+		-netdev user,id=net0,hostfwd=tcp::8200-:8200 \
+		-device virtio-net-pci,netdev=net0 \
+		-nographic
+
+$(OVMF_CODE):
+	$(MAKE) ovmf
+
+# Linting
+
+fmt: ; $(info $(M) running gofmt…) @ ## Run gofmt on all source files
+	$Q $(GO) fmt $(PKGS)
+
+# Run fmt before any linter so parallel `-jN` doesn't change files while a linter is mid flight.
+lint vulncheck: fmt
+
+lint: ; $(info $(M) running golangci-lint…) @ ## Run golangci-lint (vet, revive, staticcheck, errcheck)
+	$Q GOOS=$(GOOS) GOARCH=$(GOARCH) golangci-lint run ./...
 
 $(BIN):
 	@mkdir -p $@
@@ -40,40 +106,8 @@ $(BIN)/%: | $(BIN) ; $(info $(M) building $(PACKAGE)…)
 VULNCHECK = $(BIN)/govulncheck
 $(BIN)/govulncheck: PACKAGE=golang.org/x/vuln/cmd/govulncheck@latest
 
-# Tests
-
-TEST_TARGETS := test-verbose test-race
-.PHONY: $(TEST_TARGETS) test
-test-verbose: ARGS=-v            ## Run tests in verbose mode
-test-race:    ARGS=-race         ## Run tests with race detector
-$(TEST_TARGETS): NAME=$(MAKECMDGOALS:test-%=%)
-$(TEST_TARGETS): test
-test: fmt lint vulncheck; $(info $(M) running $(NAME:%=% )tests…) @ ## Run tests
-	$Q $(GO) test -timeout $(TIMEOUT)s $(ARGS) $(TESTPKGS)
-
-.PHONY: fmt
-fmt: ; $(info $(M) running gofmt…) @ ## Run gofmt on all source files
-	$Q $(GO) fmt $(PKGS)
-
-# Run fmt before any linter so parallel `-jN` doesn't change files while a linter is mid flight.
-lint vulncheck: fmt
-
-.PHONY: lint
-lint: ; $(info $(M) running golangci-lint…) @ ## Run golangci-lint (vet, revive, staticcheck, errcheck)
-	$Q GOOS=$(GOOS) GOARCH=$(GOARCH) golangci-lint run ./...
-
-.PHONY: vulncheck
 vulncheck: | $(VULNCHECK) ; $(info $(M) running vulncheck…) @
 	$Q GOOS=$(GOOS) GOARCH=$(GOARCH) $(VULNCHECK) $(PKGS)
 
-# Misc
-
-.PHONY: clean
-clean: ; $(info $(M) cleaning…)	@ ## Cleanup everything
-	@rm -rf $(BIN)
-	@rm -rf test/tests.*
-
-.PHONY: help
-help:
-	@grep -hE '^[ a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-17s\033[0m %s\n", $$1, $$2}'
+clean:
+	rm -rf bin build out
