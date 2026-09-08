@@ -67,6 +67,10 @@ func Detect() (installed bool, diskPath string, err error) {
 func Run(ctx context.Context, diskPath string) error {
 	fmt.Println("[install] target disk:", diskPath)
 
+	if err := disk.CheckMinimumSize(diskPath); err != nil {
+		return fmt.Errorf("install: %w", err)
+	}
+
 	ukiName, ukiBytes, sdbootBytes, err := bufferSourceFiles()
 	if err != nil {
 		return err

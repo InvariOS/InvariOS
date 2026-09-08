@@ -16,8 +16,8 @@ OVMF_DIR := .ovmf
 OVMF_CODE := $(OVMF_DIR)/OVMF_CODE_4M.fd
 OVMF_VARS := $(OVMF_DIR)/OVMF_VARS_4M.fd
 
-# The build depends on Linux-only tooling (makefs.VFAT shells out to
-# mkfs.vfat/mcopy). On Linux it can therefore run directly on the host;
+# The build depends on Linux-only tooling (cmd/build.go shells out to
+# mkfs.fat/mcopy). On Linux it can therefore run directly on the host;
 # everywhere else it needs the builder container. DOCKER=true forces
 # the container path on Linux too.
 UNAME_S := $(shell uname -s)

@@ -27,6 +27,8 @@ import (
 	"github.com/siderolabs/go-blockdevice/v2/partitioning"
 	"github.com/siderolabs/go-blockdevice/v2/partitioning/gpt"
 	"github.com/siderolabs/talos/pkg/makefs"
+
+	"github.com/invarios/invarios/internal/parttype"
 )
 
 // Partition names. IsInstalled looks for exactly these four names on an
@@ -39,32 +41,58 @@ const (
 	dataName  = "DATA"
 )
 
+// xfsMinSize is mkfs.xfs's own hard floor: it refuses to format
+// anything smaller, regardless of how much is asked for.
+const xfsMinSize = 300 * 1024 * 1024
+
 // Partition sizes, in bytes. ESP fits two UKIs plus sd-boot with
 // headroom (a single current UKI is ~95 MiB); META only needs to hold
 // the 512 KiB two-copy block internal/meta.Init writes, and is rounded
-// up generously to 1 MiB; STATE is 256 MiB, comfortably larger than the
-// configuration and CA material it will eventually hold. DATA is not a
-// fixed size -- Partition sizes it to whatever is left on the disk.
+// up generously to 1 MiB; STATE is comfortably above xfsMinSize, not
+// sized for the configuration/CA material it will eventually hold.
+// DATA is not a fixed size -- Partition sizes it to whatever is left
+// on the disk, but that remainder still has to clear xfsMinSize itself
+// (see MinimumDiskSize).
 const (
 	espSize   = 320 * 1024 * 1024
 	metaSize  = 1 * 1024 * 1024
-	stateSize = 256 * 1024 * 1024
+	stateSize = 512 * 1024 * 1024
 )
 
-// Fixed GPT partition type GUIDs, not ours to choose: espPartitionType
-// is the EFI System Partition type defined by the UEFI Specification
-// itself (section 5.7) -- firmware and boot loaders rely on this exact
-// value to find the ESP at all. dataPartitionType is the generic
-// "Linux filesystem" type (the Discoverable Partitions Specification's
-// formal name for the same value is "Generic Linux Data Partition");
-// its spec text guarantees no automatic mounting ever happens for it,
-// which is useful here, since META, STATE, and DATA are identified by
-// partition name (see IsInstalled below), not type, and nothing but
-// this package's own code should ever mount them.
-var (
-	espPartitionType  = uuid.MustParse("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
-	dataPartitionType = uuid.MustParse("0fc63daf-8483-4772-8e79-3d69d8477de4")
-)
+// MinimumDiskSize is the smallest disk CheckMinimumSize accepts: the
+// three fixed-size partitions plus a DATA partition at exactly
+// xfsMinSize, with no margin beyond that. A disk this size installs
+// successfully but leaves DATA with no real room to store anything.
+const MinimumDiskSize = espSize + metaSize + stateSize + xfsMinSize
+
+// CheckMinimumSize returns a descriptive error if diskPath is smaller
+// than MinimumDiskSize, without writing anything to it.
+//
+// Partition/Format would eventually fail on an undersized disk too --
+// either immediately, if there's no room left for a DATA partition at
+// all, or later in Format, if DATA lands under xfsMinSize -- but only
+// after Partition has already written a GPT table to the disk, and
+// with mkfs.xfs's own terse "Filesystem must be larger than 300MB."
+// rather than something that names the disk and the actual shortfall.
+func CheckMinimumSize(diskPath string) error {
+	dev, err := block.NewFromPath(diskPath)
+	if err != nil {
+		return fmt.Errorf("disk: open %s: %w", diskPath, err)
+	}
+	defer dev.Close() //nolint:errcheck
+
+	gdev, err := gpt.DeviceFromBlockDevice(dev)
+	if err != nil {
+		return fmt.Errorf("disk: wrap %s: %w", diskPath, err)
+	}
+
+	if size := gdev.GetSize(); size < MinimumDiskSize {
+		return fmt.Errorf("disk: %s is too small for invarios: %d MiB available, %d MiB required",
+			diskPath, size/(1<<20), MinimumDiskSize/(1<<20))
+	}
+
+	return nil
+}
 
 // PartitionInfo is a GPT partition entry together with its 1-indexed
 // partition number (gpt.Table.AllocatePartition's other return value,
@@ -324,15 +352,15 @@ func Partition(diskPath string) (Layout, error) {
 
 	var layout Layout
 
-	if layout.ESP, err = allocate(table, espSize, espName, espPartitionType); err != nil {
+	if layout.ESP, err = allocate(table, espSize, espName, parttype.ESP); err != nil {
 		return Layout{}, err
 	}
 
-	if layout.Meta, err = allocate(table, metaSize, metaName, dataPartitionType); err != nil {
+	if layout.Meta, err = allocate(table, metaSize, metaName, parttype.LinuxFilesystem); err != nil {
 		return Layout{}, err
 	}
 
-	if layout.State, err = allocate(table, stateSize, stateName, dataPartitionType); err != nil {
+	if layout.State, err = allocate(table, stateSize, stateName, parttype.LinuxFilesystem); err != nil {
 		return Layout{}, err
 	}
 
@@ -341,7 +369,7 @@ func Partition(diskPath string) (Layout, error) {
 		return Layout{}, errors.New("disk: no space left on disk for DATA partition")
 	}
 
-	if layout.Data, err = allocate(table, dataSize, dataName, dataPartitionType); err != nil {
+	if layout.Data, err = allocate(table, dataSize, dataName, parttype.LinuxFilesystem); err != nil {
 		return Layout{}, err
 	}
 

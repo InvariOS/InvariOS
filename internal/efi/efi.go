@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/foxboron/go-uefi/efi/attributes"
 	"github.com/foxboron/go-uefi/efi/device"
 	"github.com/foxboron/go-uefi/efi/util"
 	"github.com/foxboron/go-uefi/efivar"
@@ -101,7 +102,19 @@ func BootedEntry() (partUUID, entryFilename string, err error) {
 // entryFilename by default on every subsequent boot, without an operator
 // having to pick it from the menu, per the boot loader interface spec.
 func SetDefault(entryFilename string) error {
-	if err := vars.WriteVar(efivar.LoaderEntryDefault, utf16z(entryFilename)); err != nil {
+	// The boot loader interface spec lists LoaderEntryDefault as
+	// non-volatile (it must survive a reboot to have any effect at
+	// all), but go-uefi's own efivar.LoaderEntryDefault omits
+	// EFI_VARIABLE_NON_VOLATILE from its Attributes. Writing with that
+	// omission fails outright (EINVAL) the first time this variable is
+	// ever set, since volatile variables can't be created via
+	// SetVariable() at OS runtime -- only pre-existing ones can be
+	// updated. Attributes is a plain field on a value type, so this
+	// corrects it locally rather than patching the module.
+	loaderEntryDefault := efivar.LoaderEntryDefault
+	loaderEntryDefault.Attributes |= attributes.EFI_VARIABLE_NON_VOLATILE
+
+	if err := vars.WriteVar(loaderEntryDefault, utf16z(entryFilename)); err != nil {
 		return fmt.Errorf("efi: write LoaderEntryDefault: %w", err)
 	}
 
