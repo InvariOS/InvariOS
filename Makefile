@@ -27,8 +27,23 @@ else
 DOCKER ?= true
 endif
 
+# Go module and build caches live in named Docker volumes so they
+# survive `docker run --rm`. They are not bind-mounted from the
+# working tree: the caches are thousands of small files, and a named
+# volume stays inside Docker's Linux VM rather than crossing the host
+# filesystem.
+GO_MOD_VOLUME   := invarios-go-mod
+GO_CACHE_VOLUME := invarios-go-cache
+
+docker-mounts = \
+	-v "$(CURDIR):/work" \
+	-v "$(GO_MOD_VOLUME):/go/pkg/mod" \
+	-v "$(GO_CACHE_VOLUME):/root/.cache/go-build" \
+	-e GOMODCACHE=/go/pkg/mod \
+	-e GOCACHE=/root/.cache/go-build
+
 ifeq ($(DOCKER),true)
-docker-run = docker run --rm --platform $(PLATFORM) -v "$(CURDIR):/work" $(IMAGE)
+docker-run = docker run --rm --platform $(PLATFORM) $(docker-mounts) $(IMAGE)
 else
 docker-run =
 endif
@@ -47,7 +62,7 @@ build: $(if $(filter true,$(DOCKER)),image)
 shell: image
 	docker run --rm -it \
 		--platform $(PLATFORM) \
-		-v "$(CURDIR):/work" \
+		$(docker-mounts) \
 		$(IMAGE) \
 		bash
 
