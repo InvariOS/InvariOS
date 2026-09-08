@@ -7,7 +7,7 @@ V         = 0
 Q         = $(if $(filter 1,$V),,@)
 M         = $(shell printf "\033[34;1m▶\033[0m")
 
-IMAGE := invarios-builder
+IMAGE := ghcr.io/invarios/pkgs/builder:main
 PLATFORM := $(GOOS)/$(GOARCH)
 KERNEL_IMAGE := ghcr.io/invarios/pkgs/kernel:6.18.49-amd64
 SYSTEMD_BOOT_IMAGE := ghcr.io/invarios/pkgs/systemd-boot:261.2-amd64
@@ -36,10 +36,7 @@ endif
 .PHONY: image build shell clean ovmf boot fmt lint vulncheck
 
 image:
-	docker build \
-		--platform $(PLATFORM) \
-		-t $(IMAGE) \
-		.
+	docker pull --platform $(PLATFORM) $(IMAGE)
 
 build: $(if $(filter true,$(DOCKER)),image)
 	$(docker-run) go run . build \
