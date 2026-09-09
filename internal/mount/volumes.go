@@ -8,35 +8,31 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/invarios/invarios/internal/disk"
-)
-
-// stateMountPoint and dataMountPoint are where Volumes mounts STATE
-// and DATA. Both directories ship in the rootfs image (see
-// cmd/build.go's prepare), since by the time Volumes runs (Boot, after
-// Ephemeral) / is already read-only and can't have them created on
-// demand.
-const (
-	stateMountPoint = "/state"
-	dataMountPoint  = "/data"
+	"github.com/invarios/invarios/internal/paths"
 )
 
 // Volumes mounts STATE and DATA -- both XFS, laid out by
-// disk.Partition/disk.Format at install time -- at /state and /data
-// respectively. Both are mounted NoExec: STATE holds machine config
-// and the CA, DATA holds bao's raft directory, and neither is a store
-// PID 1 or bao should ever execute a binary from, planted there by a
-// bug or otherwise.
+// disk.Partition/disk.Format at install time -- at paths.StateDir and
+// paths.DataDir respectively. Both are mounted NoExec: STATE holds
+// machine config and the CA, DATA holds bao's raft directory, and
+// neither is a store PID 1 or bao should ever execute a binary from,
+// planted there by a bug or otherwise.
+//
+// Both mount points live in internal/paths rather than as constants
+// here, so packages that need to know where they are (e.g.
+// internal/supervise, starting bao pointed at DATA) don't have to
+// import mount itself -- see that package's doc comment for why.
 func Volumes(diskPath string) error {
 	layout, err := disk.ReadLayout(diskPath)
 	if err != nil {
 		return fmt.Errorf("reading disk layout: %w", err)
 	}
 
-	if err := mountXFS(diskPath, layout.State.Number, stateMountPoint); err != nil {
+	if err := mountXFS(diskPath, layout.State.Number, paths.StateDir); err != nil {
 		return err
 	}
 
-	return mountXFS(diskPath, layout.Data.Number, dataMountPoint)
+	return mountXFS(diskPath, layout.Data.Number, paths.DataDir)
 }
 
 // mountXFS mounts partition number of diskPath (an XFS filesystem

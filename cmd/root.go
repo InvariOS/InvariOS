@@ -84,19 +84,19 @@ func runInstall(ctx context.Context, diskPath string) {
 
 // runBoot is what an already-installed system falls through to: it
 // mounts STATE and DATA, brings up networking, starts the supervisor
-// goroutine that owns OpenBao's process lifecycle, and then serves the
-// management API. Starting OpenBao means choosing how to initialize it
-// (e.g. a new single-node store versus joining an existing cluster), and
-// nothing in this binary makes that choice on its own -- it's an
-// operator's POST /bootstrap call that decides. mgmtapi only decodes
-// that call and forwards the chosen Mode to the supervisor; the
-// supervisor's own goroutine is what calls supervise.Bootstrap (mapping
-// the Mode to a running process) and tracks whether this node has
-// already been bootstrapped. That same forwarding call is also where a
-// future boot-time recovery path would hook in: re-applying a Mode read
-// back from persisted STATE to the supervisor, without waiting for an
-// operator to call /bootstrap again, once this binary writes that
-// decision to STATE in the first place (it doesn't yet).
+// goroutine that owns OpenBao's process lifecycle, recovers a
+// previously persisted bootstrap decision if there is one, and then
+// serves the management API. Starting OpenBao means choosing how to
+// initialize it (e.g. a new single-node store versus joining an
+// existing cluster); the choice itself always comes from a Mode, either
+// read back from supervise.PersistedMode (a prior boot already decided)
+// or from an operator's POST /bootstrap (this is the first boot since
+// install). Either way, mgmtapi only decodes the /bootstrap call and
+// forwards the chosen Mode to the supervisor; the supervisor's own
+// goroutine is what calls supervise.Bootstrap (mapping the Mode to a
+// running process), tracks whether this node has already been
+// bootstrapped, and persists a successful Mode via supervise.PersistMode
+// so the next boot can skip straight to recovery.
 //
 // Unlike Install's mount.Ephemeral call (which runs unconditionally in
 // runInitialize, before it's known whether the machine is installed),
@@ -112,10 +112,22 @@ func runBoot(ctx context.Context, diskPath string) {
 		fmt.Println("[net] error:", err)
 	}
 
-	supervisor := supervise.NewSupervisor(supervise.Bootstrap)
+	supervisor := supervise.NewSupervisor(supervise.Bootstrap, supervise.PersistMode)
 	go supervisor.Run(ctx)
 
-	fmt.Println("[mgmtapi] listening on", mgmtapi.Addr, "-- awaiting bootstrap")
+	if mode, ok, err := supervise.PersistedMode(); err != nil {
+		fmt.Println("[supervise] reading persisted bootstrap state:", err)
+	} else if ok {
+		fmt.Println("[supervise] recovering previous bootstrap:", mode)
+
+		if _, err := supervisor.Bootstrap(ctx, mode); err != nil {
+			fmt.Println("[supervise] recovering previous bootstrap:", err)
+		}
+	} else {
+		fmt.Println("[mgmtapi] awaiting bootstrap")
+	}
+
+	fmt.Println("[mgmtapi] listening on", mgmtapi.Addr)
 
 	srv := mgmtapi.New(supervisor.Bootstrap)
 	if err := srv.ListenAndServe(ctx); err != nil {

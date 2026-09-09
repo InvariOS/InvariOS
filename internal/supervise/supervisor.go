@@ -3,6 +3,7 @@ package supervise
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 )
 
@@ -33,6 +34,7 @@ type bootstrapResult struct {
 // .Start() is Run's, never an HTTP handler's.
 type Supervisor struct {
 	bootstrapFn BootstrapFunc
+	persistFn   PersistFunc
 	requests    chan bootstrapRequest
 
 	// bootstrapped and cmd are only ever read or written from Run's
@@ -42,12 +44,15 @@ type Supervisor struct {
 }
 
 // NewSupervisor returns a Supervisor that calls bootstrapFn to actually
-// start a workload once Run is bootstrapped. Production code passes
-// Bootstrap; tests pass a fake so a bootstrap request doesn't spawn a
-// real child process.
-func NewSupervisor(bootstrapFn BootstrapFunc) *Supervisor {
+// start a workload once Run is bootstrapped, and persistFn to record
+// that it did so a later boot can recover the same Mode via
+// PersistedMode. Production code passes Bootstrap and PersistMode;
+// tests pass fakes so a bootstrap request doesn't spawn a real child
+// process or touch the real STATE partition.
+func NewSupervisor(bootstrapFn BootstrapFunc, persistFn PersistFunc) *Supervisor {
 	return &Supervisor{
 		bootstrapFn: bootstrapFn,
+		persistFn:   persistFn,
 		requests:    make(chan bootstrapRequest),
 	}
 }
@@ -72,19 +77,31 @@ func (m *Supervisor) Run(ctx context.Context) {
 }
 
 // bootstrap is Run's own bootstrap step: reject the request if
-// bootstrapped is already set, otherwise start the workload and record
-// that this node has bootstrapped. It lives here, rather than in a
-// caller like mgmtapi, because bootstrapped and cmd are only safe to
-// read or write from Run's goroutine.
+// bootstrapped is already set, otherwise persist mode and only then
+// start the workload. It lives here, rather than in a caller like
+// mgmtapi, because bootstrapped and cmd are only safe to read or write
+// from Run's goroutine.
+//
+// Persisting comes first, before bootstrapFn ever runs: a workload this
+// node can't durably remember choosing isn't safe to start in the first
+// place, since a reboot would forget it ever ran and this call would
+// have no way to undo whatever bootstrapFn just started. Persisting
+// mode again on a later retry (e.g. after a transient bootstrapFn
+// failure) is harmless -- it's the same value PersistMode already
+// wrote.
 func (m *Supervisor) bootstrap(ctx context.Context, mode Mode) bootstrapResult {
 	if m.bootstrapped {
 		return bootstrapResult{err: ErrAlreadyBootstrapped}
 	}
 
+	if err := m.persistFn(mode); err != nil {
+		return bootstrapResult{err: fmt.Errorf("persisting bootstrap state: %w", err)}
+	}
+
 	cmd, err := m.bootstrapFn(ctx, mode)
 	if err != nil {
 		// Not marking bootstrapped lets the caller retry: nothing
-		// about this node's state has actually changed yet.
+		// about this node's running state has actually changed yet.
 		return bootstrapResult{err: err}
 	}
 
