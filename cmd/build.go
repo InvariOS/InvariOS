@@ -60,11 +60,12 @@ var (
 	// doesn't need every one of those call sites changed later.
 	buildArch string
 
-	buildKernelImage      string
-	buildSystemdBootImage string
-	buildFsutilsImage     string
-	buildOpenBaoVersion   string
-	buildRoot             string
+	buildKernelImage         string
+	buildSystemdBootImage    string
+	buildFsutilsImage        string
+	buildCACertificatesImage string
+	buildOpenBaoVersion      string
+	buildRoot                string
 
 	// buildBootImagePushRepo is where this command pushes the boot
 	// artifact (UKI + sd-boot + loader.conf) to. buildBootImagePullRepo
@@ -97,6 +98,7 @@ func init() {
 	buildCmd.Flags().StringVar(&buildKernelImage, "kernel-image", "ghcr.io/invarios/kernel:6.18.49-amd64", "OCI image to pull the kernel from.")
 	buildCmd.Flags().StringVar(&buildSystemdBootImage, "systemd-boot-image", "ghcr.io/invarios/systemd-boot:261.2-amd64", "OCI image to pull systemd-boot from.")
 	buildCmd.Flags().StringVar(&buildFsutilsImage, "fsutils-image", "ghcr.io/invarios/fsutils:main", "OCI image to pull mkfs.vfat/mkfs.xfs from.")
+	buildCmd.Flags().StringVar(&buildCACertificatesImage, "ca-certificates-image", "ghcr.io/invarios/ca-certificates:2026-08-13", "OCI image to pull the CA certificate bundle from.")
 	buildCmd.Flags().StringVar(&buildOpenBaoVersion, "openbao-version", "2.6.2", "OpenBao release version to bundle.")
 	buildCmd.Flags().StringVar(&buildBootImagePushRepo, "boot-image-push-repo", bootimage.Repository, "OCI repository to push the boot artifact (UKI + sd-boot) to.")
 	buildCmd.Flags().StringVar(&buildBootImagePullRepo, "boot-image-pull-repo", bootimage.Repository, "OCI repository the built invarios binary pulls the boot artifact from.")
@@ -150,16 +152,20 @@ func runBuild(ctx context.Context) error {
 		return fmt.Errorf("building invarios binary: %w", err)
 	}
 
-	if err := verifyRootfs(layout); err != nil {
-		return fmt.Errorf("verifying rootfs: %w", err)
-	}
-
 	if err := installKernel(ctx, layout); err != nil {
 		return fmt.Errorf("installing kernel: %w", err)
 	}
 
 	if err := installFsutils(ctx, layout); err != nil {
 		return fmt.Errorf("installing fsutils: %w", err)
+	}
+
+	if err := installCACertificates(ctx, layout); err != nil {
+		return fmt.Errorf("installing CA certificates: %w", err)
+	}
+
+	if err := verifyRootfs(layout); err != nil {
+		return fmt.Errorf("verifying rootfs: %w", err)
 	}
 
 	sdbootDir, err := installSystemdBoot(ctx, layout)
@@ -357,6 +363,10 @@ func verifyRootfs(layout buildLayout) error {
 		}
 	}
 
+	if _, err := os.Stat(filepath.Join(layout.rootfs, "etc/ssl/certs/ca-certificates.crt")); err != nil {
+		return fmt.Errorf("missing etc/ssl/certs/ca-certificates.crt: %w", err)
+	}
+
 	return nil
 }
 
@@ -394,6 +404,18 @@ func installFsutils(ctx context.Context, layout buildLayout) error {
 	logStep("installing prebuilt fsutils (mkfs.vfat/mkfs.xfs)")
 
 	return ociimage.PullAndExtract(ctx, buildFsutilsImage, buildArch, layout.rootfs)
+}
+
+// installCACertificates pulls buildCACertificatesImage and extracts it
+// straight into the staged rootfs: that image is already laid out at
+// the path the appliance needs it at (/etc/ssl/certs/ca-certificates.crt),
+// so no per-file copying is needed. Every TLS connection the running
+// appliance makes (e.g. pulling the boot artifact during install)
+// verifies server certificates against this bundle.
+func installCACertificates(ctx context.Context, layout buildLayout) error {
+	logStep("installing CA certificate bundle")
+
+	return ociimage.PullAndExtract(ctx, buildCACertificatesImage, buildArch, layout.rootfs)
 }
 
 // installSystemdBoot pulls buildSystemdBootImage and returns the
