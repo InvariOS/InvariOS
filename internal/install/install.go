@@ -1,8 +1,9 @@
 // Package install implements the invarios "Install" sequence: on an
 // uninstalled system, partition the target disk into GPT (ESP/META/
-// STATE/DATA), format it, write the currently-booted UKI and sd-boot
-// onto the new ESP, initialize META, point EFI Default/BootOrder at the
-// new install, and reboot.
+// STATE/DATA), format it, pull the UKI and sd-boot for this exact
+// build from their OCI registry and write them onto the new ESP,
+// initialize META, point EFI Default/BootOrder at the new install, and
+// reboot.
 package install
 
 import (
@@ -10,15 +11,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
-	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 
 	"github.com/siderolabs/go-blockdevice/v2/partitioning"
 
+	"github.com/invarios/invarios/internal/bootimage"
 	"github.com/invarios/invarios/internal/disk"
 	"github.com/invarios/invarios/internal/efi"
 	"github.com/invarios/invarios/internal/meta"
+	"github.com/invarios/invarios/internal/network"
+	"github.com/invarios/invarios/internal/ociimage"
+	"github.com/invarios/invarios/internal/version"
 )
 
 // bootEntryLabel names both the Boot#### NVRAM entry EnsureBootEntry
@@ -30,18 +35,13 @@ import (
 // accumulating a duplicate one every time.
 const bootEntryLabel = "invarios"
 
-// sdbootPath and loaderConf mirror cmd/build.go's ESP staging layout
-// (stageESP/loaderConf) exactly, since Install is reproducing that same
-// layout on the target disk from a different set of inputs (the
-// currently-booted UKI/sd-boot, buffered from the source ESP, rather
-// than freshly built files) -- see that file for why each path/value is
-// what it is. There is no shared package to reference instead of
-// duplicating these two right now; both are one-line constants, so it's
-// a small duplication to accept rather than introduce one for.
+// sdbootESPPath and loaderConfPath mirror cmd/build.go's ESP staging
+// layout (stageESP) exactly, since Install reproduces that same layout
+// on the target disk from the pulled boot artifact, which is staged
+// with those same paths.
 const (
 	sdbootESPPath  = "EFI/BOOT/BOOTX64.EFI"
 	sdbootFWPath   = `\EFI\BOOT\BOOTX64.EFI` // same file, "\"-separated, as EFI_LOAD_OPTION device paths require.
-	loaderConf     = "timeout 0\n"
 	loaderConfPath = "loader/loader.conf"
 )
 
@@ -71,12 +71,19 @@ func Run(ctx context.Context, diskPath string) error {
 		return fmt.Errorf("install: %w", err)
 	}
 
-	ukiName, ukiBytes, sdbootBytes, err := bufferSourceFiles()
+	// Unlike Boot's best-effort network bring-up, install has no
+	// fallback without it: the boot artifact only comes from the
+	// registry now.
+	if err := network.Up(ctx, "eth0"); err != nil {
+		return fmt.Errorf("install: bringing up network: %w", err)
+	}
+
+	ukiName, ukiBytes, sdbootBytes, loaderConfBytes, err := fetchBootArtifact(ctx)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("[install] buffered %s (%d bytes) and sd-boot (%d bytes) from source ESP\n", ukiName, len(ukiBytes), len(sdbootBytes))
+	fmt.Printf("[install] fetched %s (%d bytes) and sd-boot (%d bytes) from %s\n", ukiName, len(ukiBytes), len(sdbootBytes), bootimage.Ref(version.Version(), runtime.GOARCH))
 
 	layout, err := disk.Partition(diskPath)
 	if err != nil {
@@ -91,7 +98,7 @@ func Run(ctx context.Context, diskPath string) error {
 
 	fmt.Println("[install] formatted ESP/STATE/DATA")
 
-	if err := writeESP(diskPath, layout, ukiName, ukiBytes, sdbootBytes); err != nil {
+	if err := writeESP(diskPath, layout, ukiName, ukiBytes, sdbootBytes, loaderConfBytes); err != nil {
 		return err
 	}
 
@@ -125,58 +132,50 @@ func Run(ctx context.Context, diskPath string) error {
 	return reboot(ctx)
 }
 
-// bufferSourceFiles locates the ESP invarios booted from (by GPT
-// partition GUID, via LoaderDevicePartUUID) and reads its UKI and
-// sd-boot binary into memory, before anything is written to the target
-// disk. Buffering first (rather than reading directly off the source
-// ESP while also formatting the target) is what makes this safe whether
-// the source and target disk are the same device -- the current
-// self-install-in-place `make boot` test loop -- or different devices,
-// e.g. a separate installer USB/ISO and a blank target disk.
-func bufferSourceFiles() (ukiName string, ukiBytes, sdbootBytes []byte, err error) {
-	partUUIDStr, ukiName, err := efi.BootedEntry()
+// fetchBootArtifact pulls this exact build's boot artifact (UKI +
+// sd-boot + loader.conf, published by cmd/build.go's pushBootImage)
+// from its OCI registry and reads it into memory, before anything is
+// written to the target disk. version.Version() names the same tag
+// pushBootImage pushed under, since both come from the same build.
+func fetchBootArtifact(ctx context.Context) (ukiName string, ukiBytes, sdbootBytes, loaderConfBytes []byte, err error) {
+	extractDir, err := os.MkdirTemp("/tmp", "boot-artifact-*")
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("install: reading booted entry: %w", err)
+		return "", nil, nil, nil, fmt.Errorf("install: creating extract dir: %w", err)
+	}
+	defer os.RemoveAll(extractDir) //nolint:errcheck
+
+	ref := bootimage.Ref(version.Version(), runtime.GOARCH)
+	if err := ociimage.PullAndExtract(ctx, ref, runtime.GOARCH, extractDir); err != nil {
+		return "", nil, nil, nil, fmt.Errorf("install: pulling boot artifact: %w", err)
 	}
 
-	partUUID, err := uuid.Parse(partUUIDStr)
+	ukiName = fmt.Sprintf("invarios-%s.efi", version.Version())
+
+	ukiBytes, err = os.ReadFile(filepath.Join(extractDir, "EFI", "Linux", ukiName))
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("install: parsing LoaderDevicePartUUID %q: %w", partUUIDStr, err)
+		return "", nil, nil, nil, fmt.Errorf("install: reading UKI: %w", err)
 	}
 
-	srcDiskPath, srcESP, err := disk.FindPartitionByGUID(partUUID)
+	sdbootBytes, err = os.ReadFile(filepath.Join(extractDir, sdbootESPPath))
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("install: locating source ESP: %w", err)
+		return "", nil, nil, nil, fmt.Errorf("install: reading sd-boot: %w", err)
 	}
 
-	srcESPPath := partitioning.DevName(srcDiskPath, uint(srcESP.Number))
-
-	mountPoint, err := mountESP(srcESPPath, true)
+	loaderConfBytes, err = os.ReadFile(filepath.Join(extractDir, loaderConfPath))
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("install: mounting source ESP %s: %w", srcESPPath, err)
-	}
-	defer unmount(mountPoint)
-
-	ukiBytes, err = os.ReadFile(filepath.Join(mountPoint, "EFI", "Linux", ukiName))
-	if err != nil {
-		return "", nil, nil, fmt.Errorf("install: reading source UKI: %w", err)
+		return "", nil, nil, nil, fmt.Errorf("install: reading loader.conf: %w", err)
 	}
 
-	sdbootBytes, err = os.ReadFile(filepath.Join(mountPoint, sdbootESPPath))
-	if err != nil {
-		return "", nil, nil, fmt.Errorf("install: reading source sd-boot: %w", err)
-	}
-
-	return ukiName, ukiBytes, sdbootBytes, nil
+	return ukiName, ukiBytes, sdbootBytes, loaderConfBytes, nil
 }
 
 // writeESP mounts the freshly formatted ESP on diskPath and writes the
-// buffered UKI, sd-boot, and a loader.conf onto it, matching
+// fetched UKI, sd-boot, and loader.conf onto it, matching
 // cmd/build.go's stageESP layout.
-func writeESP(diskPath string, layout disk.Layout, ukiName string, ukiBytes, sdbootBytes []byte) error {
+func writeESP(diskPath string, layout disk.Layout, ukiName string, ukiBytes, sdbootBytes, loaderConfBytes []byte) error {
 	espPath := partitioning.DevName(diskPath, uint(layout.ESP.Number))
 
-	mountPoint, err := mountESP(espPath, false)
+	mountPoint, err := mountESP(espPath)
 	if err != nil {
 		return fmt.Errorf("install: mounting target ESP %s: %w", espPath, err)
 	}
@@ -190,23 +189,18 @@ func writeESP(diskPath string, layout disk.Layout, ukiName string, ukiBytes, sdb
 		return err
 	}
 
-	return writeFile(filepath.Join(mountPoint, loaderConfPath), []byte(loaderConf))
+	return writeFile(filepath.Join(mountPoint, loaderConfPath), loaderConfBytes)
 }
 
-// mountESP mounts devPath (a FAT32 ESP) at a freshly created temporary
-// directory and returns the mount point.
-func mountESP(devPath string, readOnly bool) (string, error) {
+// mountESP mounts devPath (a FAT32 ESP) read-write at a freshly created
+// temporary directory and returns the mount point.
+func mountESP(devPath string) (string, error) {
 	mountPoint, err := os.MkdirTemp("/tmp", "esp-*")
 	if err != nil {
 		return "", fmt.Errorf("install: creating mount point: %w", err)
 	}
 
-	var flags uintptr
-	if readOnly {
-		flags = unix.MS_RDONLY
-	}
-
-	if err := unix.Mount(devPath, mountPoint, "vfat", flags, ""); err != nil {
+	if err := unix.Mount(devPath, mountPoint, "vfat", 0, ""); err != nil {
 		_ = os.Remove(mountPoint)
 
 		return "", fmt.Errorf("install: mounting %s at %s: %w", devPath, mountPoint, err)

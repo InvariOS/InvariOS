@@ -1,0 +1,26 @@
+# Throwaway local OCI registry for `make build`/`make boot`: the boot
+# artifact (UKI + sd-boot + loader.conf, see internal/bootimage) is
+# pushed and pulled here instead of ghcr.io, so the local build/test
+# loop never needs real internet access or registry credentials.
+services:
+  registry:
+    image: registry:2
+    ports:
+      - "127.0.0.1:${REGISTRY_HOST_PORT:-5050}:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:5000/v2/"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  registry-data:
+
+# Named explicitly so the builder container (run directly via `docker
+# run`, not as a compose service) can join it and resolve "registry" by
+# name.
+networks:
+  default:
+    name: invarios-dev

@@ -1,8 +1,11 @@
 // Package ociimage pulls OCI images from a registry and extracts their
-// filesystem contents to disk, without requiring a Docker daemon. It
-// replaces what the Dockerfile's multi-stage FROM/COPY --from= mechanism
-// did at `docker build` time: the invarios-pkgs kernel and systemd-boot
-// images are pulled directly by the build tooling instead.
+// filesystem contents to disk, and pushes a directory's contents as a
+// single-layer OCI image, without requiring a Docker daemon. Pull
+// replaces what the Dockerfile's multi-stage FROM/COPY --from=
+// mechanism did at `docker build` time: the invarios-pkgs kernel and
+// systemd-boot images are pulled directly by the build tooling instead.
+// Push publishes the boot artifact (see internal/bootimage) that
+// Install later pulls back down with the same mechanism.
 package ociimage
 
 import (
@@ -13,6 +16,9 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/crane"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/siderolabs/talos/pkg/archiver"
 	"golang.org/x/sync/errgroup"
 )
@@ -77,4 +83,82 @@ func PullAndExtract(ctx context.Context, ref, arch, destDir string) error {
 	}
 
 	return Extract(ctx, img, destDir)
+}
+
+// Push archives srcDir into a single-layer image for the given
+// architecture and pushes it to ref. insecure allows plain HTTP, for a
+// local test registry.
+func Push(ctx context.Context, ref, arch, srcDir string, insecure bool) error {
+	img, cleanup, err := imageFromDir(ctx, srcDir, arch)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	opts := []crane.Option{crane.WithContext(ctx)}
+	if insecure {
+		opts = append(opts, crane.Insecure)
+	}
+
+	if err := crane.Push(img, ref, opts...); err != nil {
+		return fmt.Errorf("pushing %s: %w", ref, err)
+	}
+
+	return nil
+}
+
+// imageFromDir builds a single-layer v1.Image out of srcDir's contents,
+// tagged for the given architecture. The returned layer reads its
+// content lazily from a temp file on disk, so the caller must run the
+// returned cleanup func only once it's done with img (e.g. after
+// pushing it), not before.
+func imageFromDir(ctx context.Context, srcDir, arch string) (v1.Image, func(), error) {
+	tgz, err := os.CreateTemp("", "ociimage-push-*.tar.gz")
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating temp archive: %w", err)
+	}
+	cleanup := func() {
+		tgz.Close()           //nolint:errcheck
+		os.Remove(tgz.Name()) //nolint:errcheck
+	}
+
+	if err := archiver.TarGz(ctx, srcDir, tgz); err != nil {
+		cleanup()
+
+		return nil, nil, fmt.Errorf("archiving %s: %w", srcDir, err)
+	}
+
+	layer, err := tarball.LayerFromFile(tgz.Name())
+	if err != nil {
+		cleanup()
+
+		return nil, nil, fmt.Errorf("building layer from %s: %w", tgz.Name(), err)
+	}
+
+	img, err := mutate.AppendLayers(empty.Image, layer)
+	if err != nil {
+		cleanup()
+
+		return nil, nil, fmt.Errorf("appending layer: %w", err)
+	}
+
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		cleanup()
+
+		return nil, nil, fmt.Errorf("reading image config: %w", err)
+	}
+
+	cfg = cfg.DeepCopy()
+	cfg.OS = "linux"
+	cfg.Architecture = arch
+
+	img, err = mutate.ConfigFile(img, cfg)
+	if err != nil {
+		cleanup()
+
+		return nil, nil, fmt.Errorf("setting image config: %w", err)
+	}
+
+	return img, cleanup, nil
 }

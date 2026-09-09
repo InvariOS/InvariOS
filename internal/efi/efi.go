@@ -1,9 +1,8 @@
-// Package efi reads and writes the EFI NVRAM variables invarios needs
-// for install and boot: the boot loader interface variables systemd-boot
-// sets/reads under its own vendor GUID (LoaderDevicePartUUID,
-// LoaderEntrySelected, LoaderEntryDefault -- see
-// https://systemd.io/BOOT_LOADER_INTERFACE/), and the firmware's own
-// Boot####/BootOrder NVRAM entries under the EFI Global GUID.
+// Package efi writes the EFI NVRAM variables invarios needs for
+// install: the boot loader interface's LoaderEntryDefault (see
+// https://systemd.io/BOOT_LOADER_INTERFACE/), which systemd-boot reads
+// under its own vendor GUID, and the firmware's own Boot####/BootOrder
+// NVRAM entries under the EFI Global GUID.
 //
 // It wraps github.com/foxboron/go-uefi, but not that module's top-level
 // "efi" package: that package only names accessors for Secure Boot state
@@ -12,14 +11,14 @@
 // package and its lower-level efivarfs/device packages are also
 // read-oriented for boot entries: device.EFILoadOption and the device
 // path types it parses have Unmarshal methods but no matching Marshal,
-// and BootOrder has no exported writer either. This package reads
-// LoaderDevicePartUUID/LoaderEntrySelected and writes LoaderEntryDefault
-// through the lower-level efivarfs/attributes packages directly, and
-// hand-encodes EFI_LOAD_OPTION (UEFI spec section 3.1.3) and the
-// BootOrder array for the two things go-uefi itself cannot write,
-// matching byte-for-byte the layout go-uefi's own device package
-// already parses on read (verified against efi/device/device.go and
-// efi/device/media_device.go in the module source).
+// and BootOrder has no exported writer either. This package writes
+// LoaderEntryDefault through the lower-level efivarfs/attributes
+// packages directly, and hand-encodes EFI_LOAD_OPTION (UEFI spec
+// section 3.1.3) and the BootOrder array for the two things go-uefi
+// itself cannot write, matching byte-for-byte the layout go-uefi's own
+// device package already parses on read (verified against
+// efi/device/device.go and efi/device/media_device.go in the module
+// source).
 package efi
 
 import (
@@ -77,26 +76,6 @@ type rawBytes []byte
 
 func (b rawBytes) Marshal(buf *bytes.Buffer) { buf.Write(b) }
 func (b rawBytes) Bytes() []byte             { return b }
-
-// BootedEntry reads LoaderDevicePartUUID and LoaderEntrySelected, both
-// set by systemd-boot immediately before it execs the chosen UKI. It
-// identifies which ESP (by GPT partition UUID) and which UKI filename
-// (the boot loader entry identifier, e.g. "invarios.efi") the running
-// system was booted from, so Install knows what to read and copy onto
-// the freshly-partitioned target disk.
-func BootedEntry() (partUUID, entryFilename string, err error) {
-	var uuidVar, entryVar efivar.Efistring
-
-	if err := vars.GetVar(efivar.LoaderDevicePartUUID, &uuidVar); err != nil {
-		return "", "", fmt.Errorf("efi: read LoaderDevicePartUUID: %w", err)
-	}
-
-	if err := vars.GetVar(efivar.LoaderEntrySelected, &entryVar); err != nil {
-		return "", "", fmt.Errorf("efi: read LoaderEntrySelected: %w", err)
-	}
-
-	return string(uuidVar), string(entryVar), nil
-}
 
 // SetDefault writes LoaderEntryDefault so systemd-boot boots
 // entryFilename by default on every subsequent boot, without an operator

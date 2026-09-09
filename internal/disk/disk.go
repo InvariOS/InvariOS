@@ -123,19 +123,6 @@ const sysClassBlock = "/sys/class/block"
 // implemented directly against sysfs rather than opening every device
 // on the system just to ask it.
 func ListNonRemovableDisks() ([]string, error) {
-	return listDisks(true)
-}
-
-// listAllDisks is like ListNonRemovableDisks but includes removable
-// media too. FindPartitionByGUID needs this: the source media for an
-// install (e.g. an installer ISO/USB) is very often removable, unlike
-// the non-removable-only target disk ListNonRemovableDisks/
-// FindSystemDisk look for.
-func listAllDisks() ([]string, error) {
-	return listDisks(false)
-}
-
-func listDisks(nonRemovableOnly bool) ([]string, error) {
 	entries, err := os.ReadDir(sysClassBlock)
 	if err != nil {
 		return nil, fmt.Errorf("disk: reading %s: %w", sysClassBlock, err)
@@ -158,102 +145,15 @@ func listDisks(nonRemovableOnly bool) ([]string, error) {
 			continue
 		}
 
-		if nonRemovableOnly {
-			removable, err := os.ReadFile(filepath.Join(sysClassBlock, name, "removable"))
-			if err != nil || strings.TrimSpace(string(removable)) != "0" {
-				continue
-			}
+		removable, err := os.ReadFile(filepath.Join(sysClassBlock, name, "removable"))
+		if err != nil || strings.TrimSpace(string(removable)) != "0" {
+			continue
 		}
 
 		disks = append(disks, filepath.Join("/dev", name))
 	}
 
 	return disks, nil
-}
-
-// FindPartitionByGUID scans every whole-disk block device (removable
-// media included, see listAllDisks) for a GPT partition whose PartGUID
-// matches partUUID, and returns the disk it was found on together with
-// its partition info. There is no /dev/disk/by-partuuid/ symlink to
-// look up directly: invarios's minimal initramfs runs no udev, so
-// nothing populates that tree.
-//
-// This is how Install locates the source ESP it booted from: systemd-
-// boot's LoaderDevicePartUUID variable (see internal/efi.BootedEntry)
-// names that ESP by its GPT partition GUID, not by a device path, since
-// the same UKI can end up booted from different device paths (a USB
-// stick's /dev/sda1 vs. a virtio disk's /dev/vda1) depending on the
-// machine.
-//
-// A partition GUID is only unique by convention, not by construction: a
-// disk cloned byte-for-byte from another (e.g. an installer USB imaged
-// from the same source as a target disk from a prior, incomplete
-// install) carries an identical one. Since this function exists to
-// locate the exact device Install is about to read its own boot files
-// from, silently picking one of several matches would risk buffering
-// the wrong disk's UKI/sd-boot without any indication that happened.
-// Finding more than one match is therefore a hard error, not a
-// best-effort pick.
-func FindPartitionByGUID(partUUID uuid.UUID) (diskPath string, info PartitionInfo, err error) {
-	disks, err := listAllDisks()
-	if err != nil {
-		return "", PartitionInfo{}, err
-	}
-
-	var matchDisks []string
-
-	var matchInfo []PartitionInfo
-
-	for _, d := range disks {
-		found, ok := findPartitionOnDisk(d, partUUID)
-		if ok {
-			matchDisks = append(matchDisks, d)
-			matchInfo = append(matchInfo, found)
-		}
-	}
-
-	switch len(matchDisks) {
-	case 0:
-		return "", PartitionInfo{}, fmt.Errorf("disk: no partition with GUID %s found", partUUID)
-	case 1:
-		return matchDisks[0], matchInfo[0], nil
-	default:
-		return "", PartitionInfo{}, fmt.Errorf("disk: partition GUID %s is not unique, found on %v", partUUID, matchDisks)
-	}
-}
-
-// findPartitionOnDisk reads d's GPT table (if any) and returns the
-// partition matching partUUID. A disk with no GPT table at all, or any
-// other read error, is treated as a non-match rather than a hard error
-// -- FindPartitionByGUID needs to keep looking at the remaining disks
-// either way.
-func findPartitionOnDisk(d string, partUUID uuid.UUID) (PartitionInfo, bool) {
-	dev, err := block.NewFromPath(d)
-	if err != nil {
-		return PartitionInfo{}, false
-	}
-	defer dev.Close() //nolint:errcheck
-
-	gdev, err := gpt.DeviceFromBlockDevice(dev)
-	if err != nil {
-		return PartitionInfo{}, false
-	}
-
-	table, err := gpt.Read(gdev)
-	if err != nil {
-		return PartitionInfo{}, false
-	}
-
-	// Partitions() is zero-indexed by slice position; the Linux kernel
-	// (and gpt.Table.AllocatePartition's own return value) number
-	// partitions 1-indexed, one past the slice position.
-	for i, p := range table.Partitions() {
-		if p != nil && p.PartGUID == partUUID {
-			return PartitionInfo{Number: i + 1, Partition: *p}, true
-		}
-	}
-
-	return PartitionInfo{}, false
 }
 
 // FindSystemDisk returns the appliance's target disk. This phase

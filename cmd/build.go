@@ -13,17 +13,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/siderolabs/go-blockdevice/v2/partitioning/gpt"
+	"github.com/siderolabs/talos/pkg/makefs"
 
+	"github.com/invarios/invarios/internal/bootimage"
 	"github.com/invarios/invarios/internal/initramfs"
 	"github.com/invarios/invarios/internal/ociimage"
 	"github.com/invarios/invarios/internal/openbao"
-	"github.com/invarios/invarios/internal/parttype"
 	"github.com/invarios/invarios/internal/uki"
 	"github.com/invarios/invarios/internal/version"
 )
@@ -32,11 +31,6 @@ import (
 // -X at internal/version's build-time variables when cross-compiling
 // the invarios binary in buildInvariosBinary.
 const modulePath = "github.com/invarios/invarios"
-
-// buildArch is the only architecture this command currently knows how
-// to build for: it selects the OCI platform pulled for the kernel and
-// systemd-boot images, and the GOARCH used to compile invarios itself.
-const buildArch = "amd64"
 
 // kernelCmdline is the command line embedded in the UKI. Both consoles
 // are listed so kernel/systemd boot messages appear on serial
@@ -59,11 +53,29 @@ const loaderConf = "timeout 0\n"
 const espImageSize = 128 << 20 // 128 MiB
 
 var (
+	// buildArch selects the OCI platform pulled for the kernel,
+	// systemd-boot, and boot-artifact images, and the GOARCH used to
+	// compile invarios itself. Only "amd64" is exercised today, but
+	// it's a flag rather than a constant so a second architecture
+	// doesn't need every one of those call sites changed later.
+	buildArch string
+
 	buildKernelImage      string
 	buildSystemdBootImage string
 	buildFsutilsImage     string
 	buildOpenBaoVersion   string
 	buildRoot             string
+
+	// buildBootImagePushRepo is where this command pushes the boot
+	// artifact (UKI + sd-boot + loader.conf) to. buildBootImagePullRepo
+	// is baked into the compiled invarios binary for Install to pull it
+	// back down from. The two differ for local testing (see the
+	// Makefile's local registry, reachable at different addresses from
+	// the build tool vs. from inside the test VM); real builds leave
+	// both at their shared default.
+	buildBootImagePushRepo string
+	buildBootImagePullRepo string
+	buildBootImageInsecure bool
 )
 
 // buildCmd builds the appliance image: it fetches OpenBao and the
@@ -81,10 +93,14 @@ var buildCmd = &cobra.Command{
 
 func init() {
 	buildCmd.Flags().StringVar(&buildRoot, "root", ".", "Repository root.")
+	buildCmd.Flags().StringVar(&buildArch, "arch", "amd64", "Target architecture (GOARCH and OCI platform).")
 	buildCmd.Flags().StringVar(&buildKernelImage, "kernel-image", "ghcr.io/invarios/pkgs/kernel:6.18.49-amd64", "OCI image to pull the kernel from.")
 	buildCmd.Flags().StringVar(&buildSystemdBootImage, "systemd-boot-image", "ghcr.io/invarios/pkgs/systemd-boot:261.2-amd64", "OCI image to pull systemd-boot from.")
 	buildCmd.Flags().StringVar(&buildFsutilsImage, "fsutils-image", "ghcr.io/invarios/pkgs/fsutils:main", "OCI image to pull mkfs.vfat/mkfs.xfs from.")
 	buildCmd.Flags().StringVar(&buildOpenBaoVersion, "openbao-version", "2.6.2", "OpenBao release version to bundle.")
+	buildCmd.Flags().StringVar(&buildBootImagePushRepo, "boot-image-push-repo", bootimage.Repository, "OCI repository to push the boot artifact (UKI + sd-boot) to.")
+	buildCmd.Flags().StringVar(&buildBootImagePullRepo, "boot-image-pull-repo", bootimage.Repository, "OCI repository the built invarios binary pulls the boot artifact from.")
+	buildCmd.Flags().BoolVar(&buildBootImageInsecure, "boot-image-insecure", false, "Allow plain HTTP against the boot image repositories (for a local test registry).")
 
 	rootCmd.AddCommand(buildCmd)
 }
@@ -192,6 +208,10 @@ func runBuild(ctx context.Context) error {
 		return fmt.Errorf("staging ESP contents: %w", err)
 	}
 
+	if err := pushBootImage(ctx, espStage, versionID); err != nil {
+		return fmt.Errorf("pushing boot image: %w", err)
+	}
+
 	efiDiskPath := filepath.Join(layout.out, "invarios-efi.img")
 	if err := buildFATImage(ctx, efiDiskPath, espStage); err != nil {
 		return fmt.Errorf("building EFI boot disk: %w", err)
@@ -282,15 +302,20 @@ func runGit(ctx context.Context, dir string, args ...string) (string, error) {
 // architecture and installs it into the staged rootfs as /usr/bin/invarios,
 // then points /init at it. tag and sha are baked into internal/version
 // via -ldflags, so the resulting binary reports the same version used
-// to generate os-release.
+// to generate os-release. internal/bootimage is baked in with
+// buildBootImagePullRepo/buildBootImageInsecure, not the push repo:
+// this binary is the one that later runs Install and pulls the boot
+// artifact back down, possibly from a different address than the one
+// this build pushed it to (see the local dev registry in the Makefile).
 func buildInvariosBinary(ctx context.Context, layout buildLayout, tag, sha string) error {
 	logStep("building invarios Go binary")
 
 	binPath := filepath.Join(layout.rootfs, "usr/bin/invarios")
 
 	ldflags := fmt.Sprintf(
-		"-X %[1]s/internal/version.Tag=%[2]s -X %[1]s/internal/version.SHA=%[3]s",
-		modulePath, tag, sha,
+		"-X %[1]s/internal/version.Tag=%[2]s -X %[1]s/internal/version.SHA=%[3]s "+
+			"-X %[1]s/internal/bootimage.Repository=%[4]s -X %[1]s/internal/bootimage.Insecure=%[5]t",
+		modulePath, tag, sha, buildBootImagePullRepo, buildBootImageInsecure,
 	)
 
 	build := exec.CommandContext(ctx, "go", "build", "-ldflags", ldflags, "-o", binPath, ".")
@@ -500,21 +525,25 @@ func stageESP(layout buildLayout, sdbootDir, ukiPath, versionID string) (string,
 	return stageDir, nil
 }
 
-// espImageSectorSize is the sector size for the ESP image's GPT:
-// gpt.DeviceFromFile and mkfs.fat both default to 512 for a plain file,
-// so both sides need to agree on this value explicitly.
-const espImageSectorSize = 512
+// pushBootImage publishes stageDir (the same tree stageESP just wrote:
+// UKI + sd-boot + loader.conf) as a single-layer OCI image tagged
+// versionID, so Install can pull it back down instead of copying it
+// from whatever booted the install media.
+func pushBootImage(ctx context.Context, stageDir, versionID string) error {
+	logStep("pushing boot image")
 
-// buildFATImage creates a fresh espImageSize disk image at imagePath,
-// wraps it in a single-partition GPT (one ESP partition filling the
-// image), and builds a FAT32 filesystem inside that partition from
-// stageDir's contents.
-//
-// The GPT wrapper is required for LoaderDevicePartUUID to get set at
-// all (see internal/efi.BootedEntry): systemd-boot only reports a
-// booted ESP's partition UUID when it's a real GPT entry. That also
-// rules out talos/pkg/makefs.VFAT here, since it can't target a
-// filesystem at a byte offset within a larger file.
+	ref := buildBootImagePushRepo + ":" + bootimage.Tag(versionID, buildArch)
+	if err := ociimage.Push(ctx, ref, buildArch, stageDir, buildBootImageInsecure); err != nil {
+		return err
+	}
+
+	logStep("boot image pushed to %s", ref)
+
+	return nil
+}
+
+// buildFATImage creates a fresh espImageSize FAT32 image at imagePath
+// and populates it with stageDir's contents.
 func buildFATImage(ctx context.Context, imagePath, stageDir string) error {
 	if err := os.RemoveAll(imagePath); err != nil {
 		return err
@@ -524,97 +553,7 @@ func buildFATImage(ctx context.Context, imagePath, stageDir string) error {
 		return err
 	}
 
-	firstLBA, lastLBA, err := partitionESPImage(imagePath)
-	if err != nil {
-		return fmt.Errorf("partitioning %s: %w", imagePath, err)
-	}
-
-	return formatAndPopulateESPPartition(ctx, imagePath, firstLBA, lastLBA, stageDir)
-}
-
-// partitionESPImage writes a single-partition GPT to imagePath: one
-// ESP-type partition filling the image (minus the GPT's own header and
-// entry array reserved at both ends). Returns that partition's first
-// and last LBA (espImageSectorSize units).
-func partitionESPImage(imagePath string) (firstLBA, lastLBA uint64, err error) {
-	f, err := os.OpenFile(imagePath, os.O_RDWR, 0)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer f.Close() //nolint:errcheck
-
-	dev, err := gpt.DeviceFromFile(f)
-	if err != nil {
-		return 0, 0, fmt.Errorf("wrapping as GPT device: %w", err)
-	}
-
-	table, err := gpt.New(dev)
-	if err != nil {
-		return 0, 0, fmt.Errorf("creating GPT table: %w", err)
-	}
-
-	size := table.LargestContiguousAllocatable()
-	if size == 0 {
-		return 0, 0, errors.New("no space left for ESP partition")
-	}
-
-	_, partition, err := table.AllocatePartition(size, "ESP", parttype.ESP)
-	if err != nil {
-		return 0, 0, fmt.Errorf("allocating ESP partition: %w", err)
-	}
-
-	if err := table.Write(); err != nil {
-		return 0, 0, fmt.Errorf("writing GPT table: %w", err)
-	}
-
-	return partition.FirstLBA, partition.LastLBA, nil
-}
-
-// formatAndPopulateESPPartition builds a FAT32 filesystem inside
-// imagePath's ESP partition (firstLBA..lastLBA) and copies stageDir's
-// contents into it, using mkfs.fat's --offset flag and mtools'
-// "@@byte-offset" suffix on -i to target that byte range directly
-// without loop-mounting imagePath.
-func formatAndPopulateESPPartition(ctx context.Context, imagePath string, firstLBA, lastLBA uint64, stageDir string) error {
-	sizeBytes := (lastLBA - firstLBA + 1) * espImageSectorSize
-	offsetBytes := firstLBA * espImageSectorSize
-
-	// BLOCK-COUNT (KiB, mkfs.fat(8)) is mandatory with --offset: mkfs.fat
-	// otherwise infers the size from the whole file, not the partition.
-	blockCount := strconv.FormatUint(sizeBytes/1024, 10)
-	offsetSectors := strconv.FormatUint(firstLBA, 10)
-
-	mkfs := exec.CommandContext(ctx, "mkfs.fat", "--offset", offsetSectors, imagePath, blockCount)
-	mkfs.Stdout = os.Stdout
-	mkfs.Stderr = os.Stderr
-
-	if err := mkfs.Run(); err != nil {
-		return fmt.Errorf("mkfs.fat: %w", err)
-	}
-
-	entries, err := os.ReadDir(stageDir)
-	if err != nil {
-		return fmt.Errorf("reading %s: %w", stageDir, err)
-	}
-
-	imageArg := fmt.Sprintf("%s@@%d", imagePath, offsetBytes)
-
-	for _, entry := range entries {
-		mcopy := exec.CommandContext(ctx, "mcopy",
-			"-s", "-p", "-Q", "-m",
-			"-i", imageArg,
-			filepath.Join(stageDir, entry.Name()),
-			"::",
-		)
-		mcopy.Stdout = os.Stdout
-		mcopy.Stderr = os.Stderr
-
-		if err := mcopy.Run(); err != nil {
-			return fmt.Errorf("mcopy %s: %w", entry.Name(), err)
-		}
-	}
-
-	return nil
+	return makefs.VFAT(ctx, imagePath, makefs.WithSourceDirectory(stageDir))
 }
 
 func createSizedFile(path string, size int64) error {

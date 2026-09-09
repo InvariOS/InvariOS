@@ -16,8 +16,8 @@ OVMF_DIR := .ovmf
 OVMF_CODE := $(OVMF_DIR)/OVMF_CODE_4M.fd
 OVMF_VARS := $(OVMF_DIR)/OVMF_VARS_4M.fd
 
-# The build depends on Linux-only tooling (cmd/build.go shells out to
-# mkfs.fat/mcopy). On Linux it can therefore run directly on the host;
+# The build depends on Linux-only tooling (makefs.VFAT shells out to
+# mkfs.vfat/mcopy). On Linux it can therefore run directly on the host;
 # everywhere else it needs the builder container. DOCKER=true forces
 # the container path on Linux too.
 UNAME_S := $(shell uname -s)
@@ -26,6 +26,37 @@ DOCKER ?= false
 else
 DOCKER ?= true
 endif
+
+# Install pulls its boot artifact from a registry (see
+# internal/bootimage) instead of copying it from whatever booted the
+# install media, so `make build` needs somewhere to push it to and
+# `make boot`'s QEMU guest needs somewhere to pull it back from. Both
+# point at the throwaway registry in docker-compose.yml, not at
+# ghcr.io/invarios/esp: local/dev builds shouldn't push dirty-tree
+# artifacts into the real registry.
+#
+# The push side runs from wherever the build tool itself runs (the
+# host on DOCKER=false, the builder container on DOCKER=true), so it
+# needs a different address than the pull side, which always runs
+# inside the QEMU guest: 10.0.2.2 is QEMU user-mode networking's alias
+# for the host, reachable regardless of where the build ran.
+#
+# REGISTRY_PORT is the container's own listening port, reachable
+# directly on the invarios-dev network without going through the host
+# port mapping below. REGISTRY_HOST_PORT is the host-published port
+# (see docker-compose.yml), used by anything reaching the registry
+# from outside that network. They're kept separate because a fixed
+# port on the host can collide with other software; the container
+# port never does.
+REGISTRY_PORT := 5000
+REGISTRY_HOST_PORT := 5050
+BOOT_IMAGE_REPO := invarios/esp
+ifeq ($(DOCKER),true)
+BOOT_IMAGE_PUSH_REPO := registry:$(REGISTRY_PORT)/$(BOOT_IMAGE_REPO)
+else
+BOOT_IMAGE_PUSH_REPO := localhost:$(REGISTRY_HOST_PORT)/$(BOOT_IMAGE_REPO)
+endif
+BOOT_IMAGE_PULL_REPO := 10.0.2.2:$(REGISTRY_HOST_PORT)/$(BOOT_IMAGE_REPO)
 
 # Go module and build caches live in named Docker volumes so they
 # survive `docker run --rm`. They are not bind-mounted from the
@@ -42,26 +73,44 @@ docker-mounts = \
 	-e GOMODCACHE=/go/pkg/mod \
 	-e GOCACHE=/root/.cache/go-build
 
+# --network invarios-dev (docker-compose.yml's network) lets the
+# builder container resolve the "registry" compose service by name,
+# for BOOT_IMAGE_PUSH_REPO above.
 ifeq ($(DOCKER),true)
-docker-run = docker run --rm --platform $(PLATFORM) $(docker-mounts) $(IMAGE)
+docker-run = docker run --rm --platform $(PLATFORM) --network invarios-dev $(docker-mounts) $(IMAGE)
 else
 docker-run =
 endif
 
-.PHONY: image build shell clean ovmf boot fmt lint vulncheck
+.PHONY: image build shell clean ovmf boot registry-up registry-down fmt lint vulncheck
 
 image:
 	docker pull --platform $(PLATFORM) $(IMAGE)
 
-build: $(if $(filter true,$(DOCKER)),image)
+# Starts the local registry (see docker-compose.yml) that Install's
+# boot artifact gets pushed to and pulled back from. --wait blocks
+# until the registry's healthcheck passes, so it's actually accepting
+# connections by the time this returns.
+registry-up:
+	REGISTRY_HOST_PORT=$(REGISTRY_HOST_PORT) docker compose up -d --wait registry
+
+registry-down:
+	docker compose down -v
+
+build: $(if $(filter true,$(DOCKER)),image) registry-up
 	$(docker-run) go run . build \
+		--arch=$(GOARCH) \
 		--kernel-image=$(KERNEL_IMAGE) \
 		--systemd-boot-image=$(SYSTEMD_BOOT_IMAGE) \
-		--openbao-version=$(OPENBAO_VERSION)
+		--openbao-version=$(OPENBAO_VERSION) \
+		--boot-image-push-repo=$(BOOT_IMAGE_PUSH_REPO) \
+		--boot-image-pull-repo=$(BOOT_IMAGE_PULL_REPO) \
+		--boot-image-insecure
 
 shell: image
 	docker run --rm -it \
 		--platform $(PLATFORM) \
+		--network invarios-dev \
 		$(docker-mounts) \
 		$(IMAGE) \
 		bash
@@ -90,6 +139,10 @@ BOOT_DISK_SIZE := 2G
 BOOT_DISK := /tmp/invarios-boot-disk.img
 
 # Quick local boot test: serial-only, no Proxmox/USB copy required.
+# Install pulls its boot artifact over the network from
+# BOOT_IMAGE_PULL_REPO, reachable from the guest via QEMU user-mode
+# networking's 10.0.2.2 host alias -- registry-up is a prerequisite so
+# it's running regardless of whether `make build` already started it.
 # Re-copies OVMF_VARS and the boot disk each run so NVRAM state (boot
 # attempts, the Boot#### entry Install creates, etc.) and any previous
 # install never carry over between separate `make boot` invocations --
@@ -97,7 +150,7 @@ BOOT_DISK := /tmp/invarios-boot-disk.img
 # invarios's own internal reboot (install, then straight into boot),
 # since that reboot restarts the guest kernel without qemu itself
 # exiting.
-boot: $(OVMF_CODE)
+boot: $(OVMF_CODE) registry-up
 	cp $(OVMF_VARS) /tmp/invarios-ovmf-vars.fd
 	cp out/invarios-efi.img $(BOOT_DISK)
 	truncate -s $(BOOT_DISK_SIZE) $(BOOT_DISK)
