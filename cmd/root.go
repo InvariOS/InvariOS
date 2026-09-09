@@ -4,14 +4,15 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/invarios/invarios/internal/console"
 	"github.com/invarios/invarios/internal/install"
+	"github.com/invarios/invarios/internal/mgmtapi"
 	"github.com/invarios/invarios/internal/mount"
 	"github.com/invarios/invarios/internal/network"
+	"github.com/invarios/invarios/internal/supervise"
 	"github.com/invarios/invarios/internal/version"
 )
 
@@ -82,11 +83,20 @@ func runInstall(ctx context.Context, diskPath string) {
 }
 
 // runBoot is what an already-installed system falls through to: it
-// mounts STATE and DATA, brings up networking, and then idles. It does
-// not call internal/supervise.StartOpenBao: starting OpenBao means
-// choosing how to initialize it (e.g. a new single-node store versus
-// joining an existing cluster), and nothing in this binary makes that
-// choice, so it waits rather than picking one on its own.
+// mounts STATE and DATA, brings up networking, starts the supervisor
+// goroutine that owns OpenBao's process lifecycle, and then serves the
+// management API. Starting OpenBao means choosing how to initialize it
+// (e.g. a new single-node store versus joining an existing cluster), and
+// nothing in this binary makes that choice on its own -- it's an
+// operator's POST /bootstrap call that decides. mgmtapi only decodes
+// that call and forwards the chosen Mode to the supervisor; the
+// supervisor's own goroutine is what calls supervise.Bootstrap (mapping
+// the Mode to a running process) and tracks whether this node has
+// already been bootstrapped. That same forwarding call is also where a
+// future boot-time recovery path would hook in: re-applying a Mode read
+// back from persisted STATE to the supervisor, without waiting for an
+// operator to call /bootstrap again, once this binary writes that
+// decision to STATE in the first place (it doesn't yet).
 //
 // Unlike Install's mount.Ephemeral call (which runs unconditionally in
 // runInitialize, before it's known whether the machine is installed),
@@ -102,12 +112,14 @@ func runBoot(ctx context.Context, diskPath string) {
 		fmt.Println("[net] error:", err)
 	}
 
-	fmt.Println("[bao] awaiting bootstrap (no bootstrap mechanism yet)")
+	supervisor := supervise.NewSupervisor(supervise.Bootstrap)
+	go supervisor.Run(ctx)
 
-	fmt.Println("Go supervisor successfully started...")
+	fmt.Println("[mgmtapi] listening on", mgmtapi.Addr, "-- awaiting bootstrap")
 
-	for {
-		time.Sleep(1 * time.Second)
+	srv := mgmtapi.New(supervisor.Bootstrap)
+	if err := srv.ListenAndServe(ctx); err != nil {
+		console.Fatal("[mgmtapi] fatal:", err)
 	}
 }
 

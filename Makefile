@@ -165,7 +165,7 @@ boot: $(OVMF_CODE) registry-up
 		-drive if=none,format=raw,file=$(TARGET_DISK),id=target \
 		-device virtio-blk-pci,drive=target \
 		-device virtio-rng-pci \
-		-netdev user,id=net0,hostfwd=tcp::8200-:8200 \
+		-netdev user,id=net0,hostfwd=tcp::8200-:8200,hostfwd=tcp::8420-:8420 \
 		-device virtio-net-pci,netdev=net0 \
 		-nographic
 
