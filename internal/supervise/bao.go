@@ -21,6 +21,13 @@ const baoPath = "/usr/bin/bao"
 // returns immediately once it has started; it does not wait for bao to
 // become ready to serve.
 //
+// -dev-no-store-token skips dev mode's usual write of the generated
+// root token to a local convenience file (normally ~/.vault-token, for
+// an interactive CLI on the same machine): mount.Ephemeral has already
+// remounted / read-only by the time this runs, that write has nowhere
+// writable to land, and the fixed -dev-root-token-id below already
+// makes the token predictable without it.
+//
 // The child's stdout/stderr are inherited, so its logs land on whatever
 // console(s) console.Setup already redirected this process's own output
 // to.
@@ -35,6 +42,7 @@ func StartOpenBao(_ context.Context) (*exec.Cmd, error) {
 		"-dev",
 		"-dev-listen-address=0.0.0.0:8200",
 		"-dev-root-token-id=root",
+		"-dev-no-store-token",
 	)
 
 	cmd.Stdout = os.Stdout
