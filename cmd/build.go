@@ -94,9 +94,9 @@ var buildCmd = &cobra.Command{
 func init() {
 	buildCmd.Flags().StringVar(&buildRoot, "root", ".", "Repository root.")
 	buildCmd.Flags().StringVar(&buildArch, "arch", "amd64", "Target architecture (GOARCH and OCI platform).")
-	buildCmd.Flags().StringVar(&buildKernelImage, "kernel-image", "ghcr.io/invarios/pkgs/kernel:6.18.49-amd64", "OCI image to pull the kernel from.")
-	buildCmd.Flags().StringVar(&buildSystemdBootImage, "systemd-boot-image", "ghcr.io/invarios/pkgs/systemd-boot:261.2-amd64", "OCI image to pull systemd-boot from.")
-	buildCmd.Flags().StringVar(&buildFsutilsImage, "fsutils-image", "ghcr.io/invarios/pkgs/fsutils:main", "OCI image to pull mkfs.vfat/mkfs.xfs from.")
+	buildCmd.Flags().StringVar(&buildKernelImage, "kernel-image", "ghcr.io/invarios/kernel:6.18.49-amd64", "OCI image to pull the kernel from.")
+	buildCmd.Flags().StringVar(&buildSystemdBootImage, "systemd-boot-image", "ghcr.io/invarios/systemd-boot:261.2-amd64", "OCI image to pull systemd-boot from.")
+	buildCmd.Flags().StringVar(&buildFsutilsImage, "fsutils-image", "ghcr.io/invarios/fsutils:main", "OCI image to pull mkfs.vfat/mkfs.xfs from.")
 	buildCmd.Flags().StringVar(&buildOpenBaoVersion, "openbao-version", "2.6.2", "OpenBao release version to bundle.")
 	buildCmd.Flags().StringVar(&buildBootImagePushRepo, "boot-image-push-repo", bootimage.Repository, "OCI repository to push the boot artifact (UKI + sd-boot) to.")
 	buildCmd.Flags().StringVar(&buildBootImagePullRepo, "boot-image-pull-repo", bootimage.Repository, "OCI repository the built invarios binary pulls the boot artifact from.")

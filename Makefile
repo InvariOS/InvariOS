@@ -7,10 +7,10 @@ V         = 0
 Q         = $(if $(filter 1,$V),,@)
 M         = $(shell printf "\033[34;1m▶\033[0m")
 
-IMAGE := ghcr.io/invarios/pkgs/builder:main
+IMAGE := ghcr.io/invarios/builder:main
 PLATFORM := $(GOOS)/$(GOARCH)
-KERNEL_IMAGE := ghcr.io/invarios/pkgs/kernel:6.18.49-amd64
-SYSTEMD_BOOT_IMAGE := ghcr.io/invarios/pkgs/systemd-boot:261.2-amd64
+KERNEL_IMAGE := ghcr.io/invarios/kernel:6.18.49-amd64
+SYSTEMD_BOOT_IMAGE := ghcr.io/invarios/systemd-boot:261.2-amd64
 OPENBAO_VERSION := 2.6.2
 OVMF_DIR := .ovmf
 OVMF_CODE := $(OVMF_DIR)/OVMF_CODE_4M.fd
