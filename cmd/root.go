@@ -100,8 +100,14 @@ func runBoot(ctx context.Context) {
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
+//
+// Errors reaching here are always from a subcommand's RunE (e.g. build):
+// the no-args root Run is the PID 1 boot path and never returns an error,
+// handling its own fatal cases internally via console.Fatal instead. Cobra
+// has already printed the error and usage by this point, so this only
+// needs to give the process a non-zero exit code.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
-		console.Fatal(err)
+		os.Exit(1)
 	}
 }
