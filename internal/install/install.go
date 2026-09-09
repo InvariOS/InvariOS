@@ -21,6 +21,7 @@ import (
 	"github.com/invarios/invarios/internal/disk"
 	"github.com/invarios/invarios/internal/efi"
 	"github.com/invarios/invarios/internal/meta"
+	"github.com/invarios/invarios/internal/mount"
 	"github.com/invarios/invarios/internal/network"
 	"github.com/invarios/invarios/internal/ociimage"
 	"github.com/invarios/invarios/internal/version"
@@ -193,14 +194,16 @@ func writeESP(diskPath string, layout disk.Layout, ukiName string, ukiBytes, sdb
 }
 
 // mountESP mounts devPath (a FAT32 ESP) read-write at a freshly created
-// temporary directory and returns the mount point.
+// temporary directory and returns the mount point. writeESP only ever
+// copies files onto it, so it's mounted noexec: nothing written here
+// should ever be run directly off the ESP.
 func mountESP(devPath string) (string, error) {
 	mountPoint, err := os.MkdirTemp("/tmp", "esp-*")
 	if err != nil {
 		return "", fmt.Errorf("install: creating mount point: %w", err)
 	}
 
-	if err := unix.Mount(devPath, mountPoint, "vfat", 0, ""); err != nil {
+	if err := unix.Mount(devPath, mountPoint, "vfat", mount.NoExec, ""); err != nil {
 		_ = os.Remove(mountPoint)
 
 		return "", fmt.Errorf("install: mounting %s at %s: %w", devPath, mountPoint, err)

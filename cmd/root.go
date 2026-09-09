@@ -35,14 +35,15 @@ var rootCmd = &cobra.Command{
 			return // Unreachable: runInstall reboots or hangs in console.Fatal.
 		}
 
-		runBoot(ctx)
+		runBoot(ctx, diskPath)
 	},
 }
 
 // runInitialize brings up the pseudo-filesystems (including efivarfs,
-// needed by both Install and Boot below) and the console, and prints
-// the startup banner. This step runs unconditionally, before it's known
-// whether the machine still needs installing.
+// needed by both Install and Boot below) and the console, mounts the
+// ephemeral filesystems and remounts / read-only (see mount.Ephemeral),
+// and prints the startup banner. This step runs unconditionally, before
+// it's known whether the machine still needs installing.
 func runInitialize() {
 	if err := mount.VirtualFilesystems(); err != nil {
 		// console.Setup hasn't run yet at this point, so console.Fatal
@@ -52,6 +53,10 @@ func runInitialize() {
 	}
 
 	console.Setup()
+
+	if err := mount.Ephemeral(); err != nil {
+		console.Fatal("[init] fatal:", err)
+	}
 
 	fmt.Println()
 	fmt.Println("========================================")
@@ -76,15 +81,23 @@ func runInstall(ctx context.Context, diskPath string) {
 	}
 }
 
-// runBoot is what an already-installed system falls through to: bring
-// up networking and enter the supervise loop. It does not start OpenBao
-// -- every boot into an installed system requires an explicit bootstrap
-// decision first (single-node/dev is a bootstrap mode, not a default
-// that bypasses bootstrap), and there is no bootstrap mechanism yet
-// (that's the Management API phase). internal/supervise.StartOpenBao
-// is unused for now, left in place for whatever the bootstrap path
-// calls once it exists.
-func runBoot(ctx context.Context) {
+// runBoot is what an already-installed system falls through to: it
+// mounts STATE and DATA, brings up networking, and then idles. It does
+// not call internal/supervise.StartOpenBao: starting OpenBao means
+// choosing how to initialize it (e.g. a new single-node store versus
+// joining an existing cluster), and nothing in this binary makes that
+// choice, so it waits rather than picking one on its own.
+//
+// Unlike Install's mount.Ephemeral call (which runs unconditionally in
+// runInitialize, before it's known whether the machine is installed),
+// mounting STATE and DATA only makes sense once diskPath is known to
+// already have them -- Install itself only formats them, on its way to
+// a reboot that lands back here.
+func runBoot(ctx context.Context, diskPath string) {
+	if err := mount.Volumes(diskPath); err != nil {
+		console.Fatal("[boot] mounting STATE/DATA:", err)
+	}
+
 	if err := network.Up(ctx, "eth0"); err != nil {
 		fmt.Println("[net] error:", err)
 	}

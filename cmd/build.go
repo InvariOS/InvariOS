@@ -261,7 +261,7 @@ func prepare(layout buildLayout) error {
 
 	// Git doesn't track empty directories, so these need to exist even
 	// when the checked-in rootfs template above didn't create them.
-	for _, dir := range []string{"usr/bin", "etc", "proc", "sys", "dev", "run", "tmp"} {
+	for _, dir := range []string{"usr/bin", "etc", "proc", "sys", "dev", "run", "tmp", "var", "state", "data"} {
 		if err := os.MkdirAll(filepath.Join(layout.rootfs, dir), 0o755); err != nil {
 			return err
 		}

@@ -218,6 +218,65 @@ func IsInstalled(diskPath string) (bool, error) {
 	return len(found) == len(want), nil
 }
 
+// ReadLayout reads diskPath's existing GPT table and returns the four
+// partitions Partition originally created, by name. It's Volumes'
+// mount-time counterpart to Partition/Format's install-time GPT write:
+// callers use it once IsInstalled has already confirmed all four names
+// are present, to get each partition's number for
+// partitioning.DevName.
+func ReadLayout(diskPath string) (Layout, error) {
+	dev, err := block.NewFromPath(diskPath)
+	if err != nil {
+		return Layout{}, fmt.Errorf("disk: open %s: %w", diskPath, err)
+	}
+	defer dev.Close() //nolint:errcheck
+
+	gdev, err := gpt.DeviceFromBlockDevice(dev)
+	if err != nil {
+		return Layout{}, fmt.Errorf("disk: wrap %s: %w", diskPath, err)
+	}
+
+	table, err := gpt.Read(gdev)
+	if err != nil {
+		return Layout{}, fmt.Errorf("disk: reading GPT table on %s: %w", diskPath, err)
+	}
+
+	var layout Layout
+
+	remaining := map[string]*PartitionInfo{
+		espName:   &layout.ESP,
+		metaName:  &layout.Meta,
+		stateName: &layout.State,
+		dataName:  &layout.Data,
+	}
+
+	// Partitions() is zero-indexed; the kernel's partition device
+	// nodes (and partitioning.DevName) are one-indexed, hence i+1 --
+	// the same convention allocate uses for AllocatePartition's own
+	// partition-number return value.
+	for i, p := range table.Partitions() {
+		if p == nil {
+			continue
+		}
+
+		if dst, ok := remaining[p.Name]; ok {
+			*dst = PartitionInfo{Number: i + 1, Partition: *p}
+			delete(remaining, p.Name)
+		}
+	}
+
+	if len(remaining) > 0 {
+		missing := make([]string, 0, len(remaining))
+		for name := range remaining {
+			missing = append(missing, name)
+		}
+
+		return Layout{}, fmt.Errorf("disk: %s missing partitions: %v", diskPath, missing)
+	}
+
+	return layout, nil
+}
+
 // allocate wraps gpt.Table.AllocatePartition into a PartitionInfo,
 // pairing its partition-number return value with the entry itself.
 func allocate(table *gpt.Table, size uint64, name string, partType uuid.UUID) (PartitionInfo, error) {
