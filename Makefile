@@ -126,41 +126,44 @@ ovmf:
 		apt-get install -y -qq --no-install-recommends ovmf >/dev/null && \
 		cp /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_VARS_4M.fd /out/'
 
-# Size `make boot`'s throwaway test disk is grown to before booting it.
-# out/invarios-efi.img itself (espImageSize in cmd/build.go) only needs
-# to hold systemd-boot + one UKI + loader.conf (~128 MiB) -- real
-# installer media (a USB stick, an ISO's El Torito image) installs onto
-# a *separate* target disk, so it never needs to be bigger than that.
-# `make boot`'s self-install-in-place loop is the one case where the
-# boot media and the install target are the same file, so it alone
-# needs headroom for the post-install GPT layout (ESP+META+STATE+DATA,
-# sized in internal/disk) to fit once Install repartitions it.
-BOOT_DISK_SIZE := 2G
-BOOT_DISK := /tmp/invarios-boot-disk.img
+# TARGET_DISK is deliberately a separate device from the boot media
+# (out/invarios.iso, attached below as a CD-ROM): booting the installer
+# and the disk it installs onto are the same device on real hardware
+# too only once installed, never before. A disk that's ever booted from
+# directly while still unpartitioned gets a generic firmware-cached
+# boot entry for that raw, filesystem-less state; once Install
+# repartitions it, that stale entry no longer resolves but still
+# outranks the fresh Boot#### entry Install creates, so the system
+# falls through to firmware's own interactive shell instead of booting
+# the new install. Real boot media (a USB stick, PXE) is never the
+# target disk itself, so it never triggers this; keeping them separate
+# here too is what makes this test representative of that.
+TARGET_DISK_SIZE := 2G
+TARGET_DISK := /tmp/invarios-target-disk.img
 
 # Quick local boot test: serial-only, no Proxmox/USB copy required.
 # Install pulls its boot artifact over the network from
 # BOOT_IMAGE_PULL_REPO, reachable from the guest via QEMU user-mode
 # networking's 10.0.2.2 host alias -- registry-up is a prerequisite so
 # it's running regardless of whether `make build` already started it.
-# Re-copies OVMF_VARS and the boot disk each run so NVRAM state (boot
-# attempts, the Boot#### entry Install creates, etc.) and any previous
-# install never carry over between separate `make boot` invocations --
-# within a single run, the same disk and OVMF vars persist across
-# invarios's own internal reboot (install, then straight into boot),
-# since that reboot restarts the guest kernel without qemu itself
-# exiting.
+# Re-copies OVMF_VARS and recreates TARGET_DISK each run so NVRAM state
+# (the Boot#### entry Install creates, etc.) and any previous install
+# never carry over between separate `make boot` invocations -- within a
+# single run, OVMF vars and TARGET_DISK persist across invarios's own
+# internal reboot (install, then straight into boot), since that reboot
+# restarts the guest kernel without qemu itself exiting.
 boot: $(OVMF_CODE) registry-up
 	cp $(OVMF_VARS) /tmp/invarios-ovmf-vars.fd
-	cp out/invarios-efi.img $(BOOT_DISK)
-	truncate -s $(BOOT_DISK_SIZE) $(BOOT_DISK)
+	rm -f $(TARGET_DISK)
+	truncate -s $(TARGET_DISK_SIZE) $(TARGET_DISK)
 	qemu-system-x86_64 \
 		-machine q35,accel=tcg \
 		-m 1G \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=/tmp/invarios-ovmf-vars.fd \
-		-drive if=none,format=raw,file=$(BOOT_DISK),id=bootdisk \
-		-device virtio-blk-pci,drive=bootdisk,bootindex=1 \
+		-cdrom out/invarios.iso \
+		-drive if=none,format=raw,file=$(TARGET_DISK),id=target \
+		-device virtio-blk-pci,drive=target \
 		-device virtio-rng-pci \
 		-netdev user,id=net0,hostfwd=tcp::8200-:8200 \
 		-device virtio-net-pci,netdev=net0 \
