@@ -1,0 +1,78 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history + tags, needed by cmd/build.go's `git describe`
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # cmd/build.go shells out to xorriso for the ISO and, via
+      # go-blockdevice's makefs.VFAT, to mkfs.vfat/mcopy for the ESP image.
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends xorriso dosfstools mtools
+
+      # Needed on every run, PRs included: internal/ociimage pulls
+      # ghcr.io/invarios/{kernel,systemd-boot,fsutils} regardless of
+      # whether this run also pushes to the real esp repo. crane picks up
+      # the credentials docker/login-action writes to ~/.docker/config.json
+      # automatically.
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # PRs build against a throwaway local registry (the same one
+      # docker-compose.yml provides for local dev) instead of the real
+      # ghcr.io/invarios/esp, so a PR build still exercises the full
+      # push/pull path without publishing anything durable.
+      - name: Start local registry (PR builds only)
+        if: github.event_name == 'pull_request'
+        run: docker compose up -d --wait registry
+
+      - name: Build (PR)
+        if: github.event_name == 'pull_request'
+        run: go run . build --boot-image-push-repo=localhost:5050/invarios/esp --boot-image-insecure
+
+      - name: Build (publish)
+        if: github.event_name != 'pull_request'
+        run: go run . build
+
+      - name: Rename artifacts with version + arch
+        id: artifacts
+        run: |
+          version=$(git describe --tags --always --match 'v[0-9]*')
+          mv out/invarios.iso "out/invarios-${version}-amd64.iso"
+          mv out/invarios-efi.img "out/invarios-${version}-amd64-efi.img"
+          echo "iso=out/invarios-${version}-amd64.iso" >> "$GITHUB_OUTPUT"
+          echo "img=out/invarios-${version}-amd64-efi.img" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: invarios-amd64
+          path: |
+            ${{ steps.artifacts.outputs.iso }}
+            ${{ steps.artifacts.outputs.img }}
+
+      - name: Attach build artifacts to the release
+        if: github.event_name == 'release'
+        run: gh release upload "${{ github.event.release.tag_name }}" ${{ steps.artifacts.outputs.iso }} ${{ steps.artifacts.outputs.img }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
