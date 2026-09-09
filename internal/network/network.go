@@ -7,6 +7,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
@@ -21,8 +23,9 @@ const dhcpTimeout = 15 * time.Second
 // hostnameOption is sent to the DHCP server as option 12 (hostname).
 const hostnameOption = "openbao"
 
-// Up brings iface up and configures it via DHCPv4: link up, address, and
-// default route (when the server offers a gateway).
+// Up brings iface up and configures it via DHCPv4: link up, address,
+// default route (when the server offers a gateway), and DNS
+// (/etc/resolv.conf from the lease's nameservers).
 //
 // Failures are returned as errors but are treated as non-fatal by the
 // caller — the appliance boots into a network-less state rather than
@@ -85,7 +88,42 @@ func Up(ctx context.Context, iface string) error {
 		fmt.Printf("[net] %s: default route via %s\n", iface, gw)
 	}
 
+	dns := ack.DNS()
+	if err := writeResolvConf(dns); err != nil {
+		return fmt.Errorf("configuring DNS: %w", err)
+	}
+
+	fmt.Printf("[net] %s: DNS %s\n", iface, joinIPs(dns))
+
 	return nil
+}
+
+// writeResolvConf writes servers as /etc/resolv.conf nameserver lines
+// so subsequent name lookups use the DHCP-offered DNS servers.
+func writeResolvConf(servers []net.IP) error {
+	if len(servers) == 0 {
+		return fmt.Errorf("DHCP offered no DNS servers")
+	}
+
+	var b strings.Builder
+	for _, ns := range servers {
+		fmt.Fprintf(&b, "nameserver %s\n", ns)
+	}
+
+	if err := os.WriteFile("/etc/resolv.conf", []byte(b.String()), 0o644); err != nil {
+		return fmt.Errorf("writing /etc/resolv.conf: %w", err)
+	}
+
+	return nil
+}
+
+func joinIPs(ips []net.IP) string {
+	parts := make([]string, len(ips))
+	for i, ip := range ips {
+		parts[i] = ip.String()
+	}
+
+	return strings.Join(parts, ", ")
 }
 
 func findLink(conn *rtnl.Conn, name string) (*net.Interface, error) {
