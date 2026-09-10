@@ -15,8 +15,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"time"
 
+	"github.com/invarios/invarios/internal/power"
 	"github.com/invarios/invarios/internal/supervise"
 )
 
@@ -26,42 +29,101 @@ import (
 // connections (e.g. an OCI registry pull) get auto-assigned.
 const Addr = "0.0.0.0:8420"
 
-// Server is the management API's HTTP handler. It holds no process or
-// bootstrap state of its own -- bootstrapFn (in production, a running
-// supervise.Supervisor's Bootstrap method) owns that, on its own
-// goroutine. Server's only job is decoding a request, forwarding it to
-// bootstrapFn, and translating the result into an HTTP response.
+// drainTimeout bounds how long ListenAndServe waits for in-flight
+// requests to finish once its ctx is canceled. The only caller that
+// cancels it is the power sequence in cmd/root.go, right after a
+// reboot/shutdown handler has accepted the request -- so what's
+// in flight is that handler's own 202, plus at most a few stragglers.
+// Anything still open after this long is cut off: the machine is going
+// down and a slow client shouldn't hold that up.
+const drainTimeout = 5 * time.Second
+
+// Server is the management API's HTTP handler. It holds no process,
+// bootstrap, or power state of its own -- bootstrapFn (in production, a
+// running supervise.Supervisor's Bootstrap method) and powerFn (a
+// power.Pending's Request method) own that, on their own terms.
+// Server's only job is decoding a request, forwarding it to the right
+// function, and translating the result into an HTTP response.
 type Server struct {
 	bootstrapFn supervise.BootstrapFunc
+	powerFn     power.RequestFunc
 }
 
 // New returns a Server that calls bootstrapFn when a bootstrap request
-// is accepted. Production code passes a supervise.Supervisor's
-// Bootstrap method; tests pass a fake so a bootstrap request doesn't
-// spawn a real child process.
-func New(bootstrapFn supervise.BootstrapFunc) *Server {
-	return &Server{bootstrapFn: bootstrapFn}
+// is accepted and powerFn when a reboot or shutdown request is.
+// Production code passes a supervise.Supervisor's Bootstrap method and a
+// power.Pending's Request method; tests pass fakes so a request doesn't
+// spawn a real child process or take the test machine down.
+func New(bootstrapFn supervise.BootstrapFunc, powerFn power.RequestFunc) *Server {
+	return &Server{bootstrapFn: bootstrapFn, powerFn: powerFn}
 }
 
-// ListenAndServe starts the management API and blocks until it exits.
-//
-// ctx is accepted for signature parity with network.Up and bootstrapFn
-// (a future graceful-shutdown path would drain in-flight requests using
-// it before returning), not wired to cancellation yet: nothing today
-// calls ListenAndServe with a ctx that is ever canceled.
-func (s *Server) ListenAndServe(_ context.Context) error {
-	srv := &http.Server{
-		Addr:    Addr,
-		Handler: s.mux(),
+// ListenAndServe starts the management API on Addr and blocks until it
+// exits: with an error if the listener or server fails on its own, or
+// with nil once ctx is canceled and in-flight requests have been
+// drained (see serve).
+func (s *Server) ListenAndServe(ctx context.Context) error {
+	l, err := net.Listen("tcp", Addr)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", Addr, err)
 	}
 
-	return srv.ListenAndServe()
+	return s.serve(ctx, l)
+}
+
+// serve runs the HTTP server on l until it fails or ctx is canceled.
+//
+// Cancellation is a graceful stop: the listener closes so no new
+// requests are accepted, and http.Server.Shutdown waits (up to
+// drainTimeout) for handlers already running to finish and their
+// responses to be written to the socket before serve returns nil.
+// That ordering is what lets a reboot/shutdown handler's 202 reach the
+// operator: cmd/root.go cancels ctx as soon as the power request is
+// recorded, then waits for this to return before it stops the
+// workload and hands the machine to the kernel. Shutdown is given a
+// fresh context rather than the already-canceled ctx, since it treats
+// its own context expiring as "stop waiting, cut everything off" --
+// passing ctx would skip the drain entirely.
+//
+// serve is separate from ListenAndServe so tests can bind an ephemeral
+// port instead of the fixed Addr.
+func (s *Server) serve(ctx context.Context, l net.Listener) error {
+	srv := &http.Server{Handler: s.mux()}
+
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(l) }()
+
+	select {
+	case err := <-served:
+		return err
+	case <-ctx.Done():
+	}
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+
+	if err := srv.Shutdown(drainCtx); err != nil {
+		// Shutdown gave up waiting; Close drops whatever is left so
+		// Serve returns and this doesn't leak into the power sequence.
+		_ = srv.Close()
+		<-served
+
+		return fmt.Errorf("draining in-flight requests: %w", err)
+	}
+
+	// Serve returns http.ErrServerClosed after a successful Shutdown;
+	// that's the expected outcome here, not a failure.
+	<-served
+
+	return nil
 }
 
 // mux builds the management API's route table.
 func (s *Server) mux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(http.MethodPost+" /bootstrap", s.handleBootstrap)
+	mux.HandleFunc(http.MethodPost+" /reboot", s.handlePower(power.Reboot, "rebooting"))
+	mux.HandleFunc(http.MethodPost+" /shutdown", s.handlePower(power.Shutdown, "shutting-down"))
 
 	return mux
 }
@@ -74,6 +136,12 @@ type bootstrapRequest struct {
 // bootstrapResponse is the JSON body a successful POST /bootstrap
 // response carries.
 type bootstrapResponse struct {
+	Status string `json:"status"`
+}
+
+// powerResponse is the JSON body a successful POST /reboot or
+// POST /shutdown response carries.
+type powerResponse struct {
 	Status string `json:"status"`
 }
 
@@ -107,6 +175,8 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, supervise.ErrAlreadyBootstrapped):
 			writeError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, supervise.ErrStopping):
+			writeError(w, http.StatusServiceUnavailable, err.Error())
 		default:
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("starting workload: %v", err))
 		}
@@ -115,6 +185,37 @@ func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, bootstrapResponse{Status: "bootstrapped"})
+}
+
+// handlePower returns the handler for a power endpoint: it asks powerFn
+// to record action and, if accepted, answers 202 with status as the
+// response's status field.
+//
+// 202 Accepted rather than 200 because the action has only been
+// recorded at that point, not performed: the machine goes down after
+// this response is written, once cmd/root.go has drained this server
+// and stopped the workload. The request body is ignored -- there's
+// nothing to parameterize yet, and the endpoint's path already says
+// which action is wanted.
+//
+// Like handleBootstrap, this tracks no state of its own: whether an
+// action is already pending is powerFn's decision (ErrAlreadyRequested),
+// translated here to 409.
+func (s *Server) handlePower(action power.Action, status string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := s.powerFn(r.Context(), action); err != nil {
+			switch {
+			case errors.Is(err, power.ErrAlreadyRequested):
+				writeError(w, http.StatusConflict, err.Error())
+			default:
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("requesting %s: %v", action, err))
+			}
+
+			return
+		}
+
+		writeJSON(w, http.StatusAccepted, powerResponse{Status: status})
+	}
 }
 
 // writeJSON encodes v as the JSON response body with the given status

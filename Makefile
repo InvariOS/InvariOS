@@ -82,7 +82,7 @@ else
 docker-run =
 endif
 
-.PHONY: image build shell clean ovmf boot registry-up registry-down fmt lint vulncheck
+.PHONY: image build shell clean ovmf boot registry-up registry-down fmt lint vulncheck test
 
 image:
 	docker pull --platform $(PLATFORM) $(IMAGE)
@@ -171,6 +171,15 @@ boot: $(OVMF_CODE) registry-up
 
 $(OVMF_CODE):
 	$(MAKE) ovmf
+
+# Testing
+
+# Most packages only compile on Linux (unix syscalls, go-blockdevice,
+# Talos makefs), so on other hosts the whole suite runs inside the
+# builder container, same as `make build`. Any package may therefore
+# depend on Linux-only APIs; nothing is kept portable just for tests.
+test: $(if $(filter true,$(DOCKER)),image)
+	$(docker-run) go test ./...
 
 # Linting
 

@@ -28,6 +28,28 @@ const ttyPath = "/dev/tty0"
 // this goroutine to find out.
 var realConsoles []io.Writer
 
+// pipeReader is the read end of the stdout/stderr pipe Setup installs
+// (nil until/unless it does), drained by the goroutine Setup starts.
+// Flush inspects it to find out whether that goroutine has caught up.
+var pipeReader *os.File
+
+// flushTimeout bounds how long Flush waits for the pipe to drain. It's
+// generous relative to how quickly the drain goroutine normally keeps
+// up (microseconds), so reaching it means the console is wedged -- in
+// which case waiting longer won't help, and holding up a reboot for it
+// is worse than losing the tail of the log.
+const flushTimeout = 2 * time.Second
+
+// flushGrace is how long Flush lingers after the pipe reads empty. An
+// empty pipe means the drain goroutine has read everything, not that
+// its final Write to the tty/serial device has completed, and there's
+// no way to observe that from here. The same pause also gives the
+// kernel a moment to put any in-flight network responses (mgmtapi's
+// 202 to a reboot request) on the wire, which reboot(2) otherwise
+// doesn't wait for -- so Flush pauses for it even when Setup installed
+// no pipe.
+const flushGrace = 100 * time.Millisecond
+
 // Setup fans stdout and stderr out to both the console already in place
 // (bound by the kernel before this process was exec'd) and /dev/tty0,
 // when the latter exists. It's a no-op when /dev/tty0 doesn't exist --
@@ -96,10 +118,43 @@ func Setup() {
 	// zero value, so Fatal correctly falls back to its plain path
 	// instead of writing into files this function already closed.
 	realConsoles = []io.Writer{original, tty}
+	pipeReader = r
 
 	go func() {
 		_, _ = io.Copy(io.MultiWriter(original, tty), r)
 	}()
+}
+
+// Flush waits, briefly and best-effort, for everything written to
+// stdout/stderr so far to have been read out of the pipe Setup
+// installed and handed to the real console(s). It exists for the one
+// moment that matters: right before reboot(2), which discards whatever
+// the drain goroutine hasn't copied yet -- the "[install] rebooting"
+// line, bao's own shutdown messages -- with no chance to catch up.
+//
+// It observes the pipe's unread byte count (TIOCINQ, Linux's name for
+// FIONREAD; on a pipe it reports bytes not yet read) rather than
+// coordinating with the drain goroutine because that goroutine copies
+// blindly and the writers include child processes (bao inherits fd
+// 1/2) this package never sees; the pipe itself is the only place every
+// writer's bytes pass through. When Setup installed no pipe, writes
+// already go straight to the kernel's console and only the trailing
+// flushGrace pause applies (see its comment for why it still matters).
+func Flush() {
+	if pipeReader != nil {
+		deadline := time.Now().Add(flushTimeout)
+
+		for time.Now().Before(deadline) {
+			unread, err := unix.IoctlGetInt(int(pipeReader.Fd()), unix.TIOCINQ)
+			if err != nil || unread == 0 {
+				break
+			}
+
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	time.Sleep(flushGrace)
 }
 
 // Fatal prints args exactly like fmt.Println, straight to the real

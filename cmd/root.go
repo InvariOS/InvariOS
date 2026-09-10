@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -12,9 +13,17 @@ import (
 	"github.com/invarios/invarios/internal/mgmtapi"
 	"github.com/invarios/invarios/internal/mount"
 	"github.com/invarios/invarios/internal/network"
+	"github.com/invarios/invarios/internal/power"
 	"github.com/invarios/invarios/internal/supervise"
 	"github.com/invarios/invarios/internal/version"
 )
+
+// stopGrace is how long runPower gives the workload to exit after
+// SIGTERM before it's killed. bao's graceful stop (seal, close
+// listeners) normally takes well under a second; this leaves room for a
+// future raft-backed mode flushing storage without letting a hung
+// process hold up a reboot indefinitely.
+const stopGrace = 15 * time.Second
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -73,7 +82,7 @@ func runInitialize() {
 
 // runInstall installs invarios onto diskPath and reboots. It does not
 // return on success: install.Run's own success path ends in
-// unix.Reboot, which hands control back to the firmware. Only the
+// power.Do (reboot(2)), which hands control back to the firmware. Only the
 // failure path returns here, and that's fatal -- there's no disk to
 // boot from yet to fall back to.
 func runInstall(ctx context.Context, diskPath string) {
@@ -97,6 +106,14 @@ func runInstall(ctx context.Context, diskPath string) {
 // running process), tracks whether this node has already been
 // bootstrapped, and persists a successful Mode via supervise.PersistMode
 // so the next boot can skip straight to recovery.
+//
+// The API keeps serving until an operator asks for a reboot or
+// shutdown: mgmtapi records that in pending (again without acting on
+// it), this goroutine sees it and hands off to runPower, which winds
+// the node down in order. The server running in its own goroutine,
+// rather than blocking here as it used to, is what lets this goroutine
+// be the one that waits for either outcome -- the server failing on
+// its own (fatal, as before) or a power request arriving.
 //
 // Unlike Install's mount.Ephemeral call (which runs unconditionally in
 // runInitialize, before it's known whether the machine is installed),
@@ -129,9 +146,75 @@ func runBoot(ctx context.Context, diskPath string) {
 
 	fmt.Println("[mgmtapi] listening on", mgmtapi.Addr)
 
-	srv := mgmtapi.New(supervisor.Bootstrap)
-	if err := srv.ListenAndServe(ctx); err != nil {
+	pending := power.NewPending()
+	srv := mgmtapi.New(supervisor.Bootstrap, pending.Request)
+
+	srvCtx, stopServing := context.WithCancel(ctx)
+	defer stopServing()
+
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- srv.ListenAndServe(srvCtx) }()
+
+	select {
+	case err := <-srvDone:
+		// Only reachable if the server failed on its own: a graceful
+		// stop happens below, after pending fires, never before.
 		console.Fatal("[mgmtapi] fatal:", err)
+	case <-pending.Done():
+	}
+
+	runPower(ctx, pending.Action(), stopServing, srvDone, supervisor)
+}
+
+// runPower takes an installed, running node down for action. It does
+// not return on success: power.Do's success path ends in reboot(2),
+// which hands control back to the firmware. The steps, in order:
+//
+//  1. Stop the management API and wait for it to drain. The operator's
+//     request is still being answered when this starts (the handler
+//     only recorded action), and the drain is what guarantees its 202
+//     reaches them before anything else happens. It also means no
+//     further requests can arrive from here on.
+//  2. Stop the workload, giving it stopGrace to exit on SIGTERM before
+//     it's killed. Nothing the supervisor started may still be writing
+//     to DATA or STATE by the time they're unmounted.
+//  3. Unmount DATA and STATE, so their XFS logs are clean on the next
+//     mount.
+//  4. power.Do: flush the console, sync, reboot(2).
+//
+// Steps 1-3 log their failures and carry on rather than aborting: the
+// operator asked for the machine to go down, and a stuck drain, a
+// workload that had to be killed, or a volume that couldn't be
+// unmounted are all things the next boot recovers from, whereas a node
+// that refuses to reboot over them needs someone at the console. Only
+// power.Do returning at all is fatal -- there's no further step to
+// fall back to, and console.Fatal keeps the reason on screen.
+func runPower(ctx context.Context, action power.Action, stopServing context.CancelFunc, srvDone <-chan error, supervisor *supervise.Supervisor) {
+	fmt.Println("[power]", action, "requested")
+
+	stopServing()
+
+	if err := <-srvDone; err != nil {
+		fmt.Println("[mgmtapi] stopping:", err)
+	}
+
+	stopCtx, cancel := context.WithTimeout(ctx, stopGrace)
+	defer cancel()
+
+	if err := supervisor.Stop(stopCtx); err != nil {
+		fmt.Println("[supervise] stopping workload:", err)
+	} else {
+		fmt.Println("[supervise] workload stopped")
+	}
+
+	if err := mount.UnmountVolumes(); err != nil {
+		fmt.Println("[power] unmounting volumes:", err)
+	}
+
+	fmt.Println("[power]", action)
+
+	if err := power.Do(action); err != nil {
+		console.Fatal("[power] fatal:", err)
 	}
 }
 

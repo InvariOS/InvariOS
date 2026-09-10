@@ -24,6 +24,7 @@ import (
 	"github.com/invarios/invarios/internal/mount"
 	"github.com/invarios/invarios/internal/network"
 	"github.com/invarios/invarios/internal/ociimage"
+	"github.com/invarios/invarios/internal/power"
 	"github.com/invarios/invarios/internal/version"
 )
 
@@ -130,7 +131,16 @@ func Run(ctx context.Context, diskPath string) error {
 	fmt.Println("[install] set LoaderEntryDefault and Boot#### entry")
 	fmt.Println("[install] rebooting into new install")
 
-	return reboot(ctx)
+	// power.Do flushes the console (so the line above actually lands),
+	// syncs, and reboots; it only returns on failure. There's nothing
+	// of Install's own left to wind down first: the target ESP was
+	// unmounted when writeESP returned and META was fsynced by
+	// meta.Init.
+	if err := power.Do(power.Reboot); err != nil {
+		return fmt.Errorf("install: rebooting: %w", err)
+	}
+
+	return nil
 }
 
 // fetchBootArtifact pulls this exact build's boot artifact (UKI +
@@ -234,17 +244,6 @@ func writeFile(path string, data []byte) error {
 
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("install: writing %s: %w", path, err)
-	}
-
-	return nil
-}
-
-// reboot flushes pending writes and restarts the machine.
-func reboot(_ context.Context) error {
-	unix.Sync()
-
-	if err := unix.Reboot(unix.LINUX_REBOOT_CMD_RESTART); err != nil {
-		return fmt.Errorf("install: rebooting: %w", err)
 	}
 
 	return nil

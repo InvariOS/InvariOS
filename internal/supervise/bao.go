@@ -1,9 +1,11 @@
 // Package supervise starts OpenBao as a supervised child process.
 //
 // bao is never PID 1: the Go binary that calls StartOpenBao is PID 1
-// itself, so bao is started with os/exec rather than syscall.Exec, and its
-// exit is observed via Wait in a goroutine so it doesn't linger as a
-// zombie.
+// itself, so bao is started with os/exec rather than syscall.Exec.
+// Nothing Waits on it while it runs -- the only Wait today is in
+// Supervisor.stop, when the node is going down -- so a bao that exits
+// on its own lingers as a zombie until then. Observing and reacting to
+// that exit (reaping, restarting) is not implemented yet.
 package supervise
 
 import (
@@ -32,9 +34,12 @@ const baoPath = "/usr/bin/bao"
 // console(s) console.Setup already redirected this process's own output
 // to.
 // It is deliberately started with exec.Command, not exec.CommandContext:
-// bao's lifetime is not tied to ctx, since this slice has no shutdown
-// path yet that would cancel it. ctx is accepted for signature parity
-// with network.Up and future use (e.g. a supervised restart loop).
+// bao's lifetime is not tied to ctx. Stopping it is Supervisor.stop's
+// job, which signals the returned process explicitly (SIGTERM, then
+// SIGKILL after a grace period) so the shutdown sequence controls the
+// timing, rather than a context cancellation that could only ever
+// SIGKILL. ctx is accepted for signature parity with network.Up and
+// future use (e.g. a supervised restart loop).
 func StartOpenBao(_ context.Context) (*exec.Cmd, error) {
 	cmd := exec.Command(
 		baoPath,
