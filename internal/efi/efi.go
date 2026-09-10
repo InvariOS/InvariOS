@@ -52,12 +52,26 @@ const (
 	gptSignatureType   uint8 = 0x02
 )
 
-// varsOnce holds the package's single efivarfs handle. It is opened
-// lazily (rather than at package init) so importing this package never
-// touches the filesystem, only actually calling one of its functions
-// does -- e.g. `go build`/`go vet` and unit tests that don't call this
-// package still work outside of an environment with efivarfs mounted.
-var vars = efivarfs.NewFS().Open()
+// vars is the package's single efivarfs handle. Constructing it touches
+// nothing on disk: go-uefi only opens files under /sys/firmware/efi/
+// efivars when a variable is actually read or written, so importing
+// this package (e.g. for `go build`/`go vet` and unit tests of the pure
+// encoding functions below) works outside an environment with efivarfs
+// mounted.
+//
+// CheckImmutable + UnsetImmutable are load-bearing for re-installs. The
+// kernel marks every efivarfs file immutable (chattr +i) unless its
+// name/GUID is on a small built-in whitelist of EFI Global Variables
+// (Boot####, BootOrder, ...), to keep casual `rm -rf` from bricking
+// firmware. LoaderEntryDefault lives under systemd-boot's vendor GUID,
+// so the file the first install creates comes back immutable, and any
+// later open for write fails with EPERM. Creating a variable that
+// doesn't exist yet bypasses that check, which is why a first install
+// on fresh NVRAM works and only the second install on the same firmware
+// fails. With both flags set, go-uefi checks for and clears the
+// immutable bit before every write, the same thing efibootmgr and
+// bootctl do.
+var vars = efivarfs.NewFS().CheckImmutable().UnsetImmutable().Open()
 
 // utf16z is a NUL-terminated UTF-16LE string, the wire format most
 // boot-loader-interface variables use. efivar.Efistring already decodes
