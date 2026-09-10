@@ -1,9 +1,19 @@
 // Package install implements the invarios "Install" sequence: on an
 // uninstalled system, partition the target disk into GPT (ESP/META/
 // STATE/DATA), format it, pull the UKI and sd-boot for this exact
-// build from their OCI registry and write them onto the new ESP,
-// initialize META, point EFI Default/BootOrder at the new install, and
+// build from their OCI registry and write them onto the new ESP, point
+// EFI Default/BootOrder at the new install, initialize META, and
 // reboot.
+//
+// META is initialized last on purpose: its valid ADV is what
+// disk.IsInstalled (via meta.IsInitialized) treats as the marker that
+// the whole sequence completed. Everything before it can fail -- a
+// device node that never appears, mkfs, the ESP mount, an EFI
+// variable write -- or the machine can lose power, and the next boot
+// still sees "not installed" and runs Install again from the top,
+// instead of trying to Boot a disk that's only partly there. Run wipes
+// any previous install's META right after partitioning for the same
+// reason (see meta.Wipe).
 package install
 
 import (
@@ -12,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -94,6 +105,21 @@ func Run(ctx context.Context, diskPath string) error {
 
 	fmt.Println("[install] partitioned", diskPath)
 
+	// From here until meta.Init at the end, the disk must read as "not
+	// installed" (see the package doc). A repeat install lays META out
+	// at the same LBA as the last one, so its still-valid ADV has to go
+	// before anything else is touched -- and the device node for it
+	// isn't guaranteed to exist yet the instant Partition returns.
+	metaPath := partitioning.DevName(diskPath, uint(layout.Meta.Number))
+
+	if err := disk.WaitForPartition(metaPath, 5*time.Second); err != nil {
+		return fmt.Errorf("install: %w", err)
+	}
+
+	if err := meta.Wipe(metaPath); err != nil {
+		return fmt.Errorf("install: wiping META: %w", err)
+	}
+
 	if err := disk.Format(diskPath, layout); err != nil {
 		return fmt.Errorf("install: formatting %s: %w", diskPath, err)
 	}
@@ -105,13 +131,6 @@ func Run(ctx context.Context, diskPath string) error {
 	}
 
 	fmt.Println("[install] wrote UKI + sd-boot + loader.conf to new ESP")
-
-	metaPath := partitioning.DevName(diskPath, uint(layout.Meta.Number))
-	if err := meta.Init(metaPath); err != nil {
-		return fmt.Errorf("install: initializing META: %w", err)
-	}
-
-	fmt.Println("[install] initialized META")
 
 	if err := efi.SetDefault(ukiName); err != nil {
 		return fmt.Errorf("install: setting LoaderEntryDefault: %w", err)
@@ -129,6 +148,15 @@ func Run(ctx context.Context, diskPath string) error {
 	}
 
 	fmt.Println("[install] set LoaderEntryDefault and Boot#### entry")
+
+	// Last, and only once everything above succeeded: this is the
+	// install-complete marker disk.IsInstalled checks for on the next
+	// boot.
+	if err := meta.Init(metaPath); err != nil {
+		return fmt.Errorf("install: initializing META: %w", err)
+	}
+
+	fmt.Println("[install] initialized META (install complete)")
 	fmt.Println("[install] rebooting into new install")
 
 	// power.Do flushes the console (so the line above actually lands),

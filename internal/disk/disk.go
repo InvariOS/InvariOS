@@ -28,12 +28,13 @@ import (
 	"github.com/siderolabs/go-blockdevice/v2/partitioning/gpt"
 	"github.com/siderolabs/talos/pkg/makefs"
 
+	"github.com/invarios/invarios/internal/meta"
 	"github.com/invarios/invarios/internal/parttype"
 )
 
 // Partition names. IsInstalled looks for exactly these four names on an
-// existing GPT table to decide whether the disk already has an invarios
-// install on it.
+// existing GPT table (plus a valid ADV on META, see below) to decide
+// whether the disk already has an invarios install on it.
 const (
 	espName   = "ESP"
 	metaName  = "META"
@@ -176,9 +177,21 @@ func FindSystemDisk() (string, error) {
 	}
 }
 
-// IsInstalled reports whether diskPath already has an invarios GPT
-// layout on it, by checking that all four expected partition names are
-// present.
+// IsInstalled reports whether diskPath holds a *complete* invarios
+// install: all four expected partition names are present in its GPT
+// table, and META carries a valid ADV (meta.IsInitialized).
+//
+// The partition names alone are not enough. They're true the instant
+// Partition's table.Write lands, which is the first of several steps
+// Install then performs (format, ESP contents, EFI variables); if any
+// of those fails, or the machine loses power partway through, a
+// names-only check would report "installed" on the next boot and send
+// the machine down the Boot path against a disk with no filesystems
+// or no boot entry -- a fatal it can never recover from on its own.
+// Install writes the ADV as its very last step (after first wiping any
+// previous install's copy), so it's the one thing on the disk whose
+// presence means every earlier step completed. A partial install
+// therefore looks "not installed" here and Install simply runs again.
 //
 // TODO: any failure to read a GPT table at all -- most commonly the
 // expected case of a blank disk with no table yet, but also a genuine
@@ -208,14 +221,39 @@ func IsInstalled(diskPath string) (bool, error) {
 
 	want := map[string]bool{espName: true, metaName: true, stateName: true, dataName: true}
 	found := make(map[string]bool, len(want))
+	metaNumber := 0
 
-	for _, p := range table.Partitions() {
-		if p != nil && want[p.Name] {
-			found[p.Name] = true
+	// Partitions() is zero-indexed; the kernel's partition device nodes
+	// (and partitioning.DevName) are one-indexed, hence i+1 -- the same
+	// convention ReadLayout and allocate use.
+	for i, p := range table.Partitions() {
+		if p == nil || !want[p.Name] {
+			continue
+		}
+
+		found[p.Name] = true
+
+		if p.Name == metaName {
+			metaNumber = i + 1
 		}
 	}
 
-	return len(found) == len(want), nil
+	if len(found) != len(want) {
+		return false, nil
+	}
+
+	// The kernel enumerates partitions when it discovers the disk, so
+	// unlike right after Partition (see WaitForPartition) the device
+	// node is expected to already exist here. Still wait briefly rather
+	// than failing outright: devtmpfs populates asynchronously and this
+	// runs very early in boot.
+	metaPath := partitioning.DevName(diskPath, uint(metaNumber))
+
+	if err := WaitForPartition(metaPath, 5*time.Second); err != nil {
+		return false, err
+	}
+
+	return meta.IsInitialized(metaPath)
 }
 
 // ReadLayout reads diskPath's existing GPT table and returns the four
@@ -339,12 +377,14 @@ func Partition(diskPath string) (Layout, error) {
 	return layout, nil
 }
 
-// waitForDevice polls for path to appear. gpt.Table.Write adds the new
-// kernel partitions via the BLKPG ioctl (see (*gpt.Table).syncKernel),
-// which triggers a uevent that devtmpfs reacts to asynchronously -- the
-// new /dev/<disk>N node is not guaranteed to exist the instant Write
-// returns.
-func waitForDevice(path string, timeout time.Duration) error {
+// WaitForPartition polls for path (a partition device node such as
+// /dev/vda2) to appear. gpt.Table.Write adds the new kernel partitions
+// via the BLKPG ioctl (see (*gpt.Table).syncKernel), which triggers a
+// uevent that devtmpfs reacts to asynchronously -- the new /dev/<disk>N
+// node is not guaranteed to exist the instant Write returns. Exported
+// because internal/install has the same need before it can wipe META
+// straight after Partition.
+func WaitForPartition(path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
 	for {
@@ -368,7 +408,7 @@ type mkfsFunc func(ctx context.Context, partname string, setters ...makefs.Optio
 func formatOne(ctx context.Context, diskPath string, partition PartitionInfo, label string, mkfs mkfsFunc) error {
 	partname := partitioning.DevName(diskPath, uint(partition.Number))
 
-	if err := waitForDevice(partname, 5*time.Second); err != nil {
+	if err := WaitForPartition(partname, 5*time.Second); err != nil {
 		return err
 	}
 
