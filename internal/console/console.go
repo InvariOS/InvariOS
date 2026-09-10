@@ -120,9 +120,51 @@ func Setup() {
 	realConsoles = []io.Writer{original, tty}
 	pipeReader = r
 
-	go func() {
-		_, _ = io.Copy(io.MultiWriter(original, tty), r)
-	}()
+	go drain(r, original, tty)
+}
+
+// drainBufSize is how much drain reads from the pipe per iteration.
+// Half the pipe's default 64 KiB capacity: large enough that a burst
+// of bao log output moves in a couple of reads, small enough that a
+// single write to a 115200-baud serial console doesn't monopolize the
+// loop for very long.
+const drainBufSize = 32 * 1024
+
+// drain copies everything written to r onto each of dsts, forever. It
+// is Setup's background goroutine, and its one hard rule is that it
+// never stops reading r while the pipe's write end is open.
+//
+// That rule is why this isn't io.Copy(io.MultiWriter(dsts...), r):
+// io.Copy returns on the first write error to *either* destination
+// (EIO from /dev/tty0 during a VT switch, a hung-up serial line, a
+// short write), and once nothing reads the pipe its 64 KiB buffer
+// fills and every subsequent write(2) to fd 1/2 -- every fmt.Println
+// in PID 1, every log line from bao, which inherits those fds --
+// blocks forever. runPower prints before it stops the workload, so a
+// reboot request would be answered 202 and then never happen. Here
+// each destination is written independently and a failure is simply
+// dropped: losing output on one dead console is fine, wedging the
+// whole node is not.
+//
+// Read only fails once the pipe's write end is closed everywhere,
+// which never happens during Setup's lifetime (fd 1 and 2 hold it),
+// so returning on a read error is just tidy shutdown, not a way the
+// rule above gets broken.
+func drain(r io.Reader, dsts ...io.Writer) {
+	buf := make([]byte, drainBufSize)
+
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			for _, dst := range dsts {
+				_, _ = dst.Write(buf[:n])
+			}
+		}
+
+		if err != nil {
+			return
+		}
+	}
 }
 
 // Flush waits, briefly and best-effort, for everything written to

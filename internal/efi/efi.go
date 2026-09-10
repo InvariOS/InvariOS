@@ -19,6 +19,16 @@
 // device package already parses on read (verified against
 // efi/device/device.go and efi/device/media_device.go in the module
 // source).
+//
+// Reading existing Boot#### entries deliberately does *not* go through
+// go-uefi's device package either, even though it can parse them. That
+// parser calls log.Fatalf (os.Exit) on any short read and on Expanded
+// ACPI nodes, and silently desynchronizes on unknown media subtypes;
+// this process is PID 1, so an os.Exit is a kernel panic, and the scan
+// runs against whatever vendor entries the firmware already holds
+// (Hyper-V's AcpiEx(...), AMI's PcieRoot(0x0), ...). loadOptionHeader
+// decodes only the fixed header and description, which is all this
+// package needs, and returns an error instead of exiting on bad input.
 package efi
 
 import (
@@ -26,8 +36,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
+	"io/fs"
+	"os"
+	"path"
+	"unicode/utf16"
 
 	"github.com/foxboron/go-uefi/efi/attributes"
 	"github.com/foxboron/go-uefi/efi/device"
@@ -52,12 +64,26 @@ const (
 	gptSignatureType   uint8 = 0x02
 )
 
-// varsOnce holds the package's single efivarfs handle. It is opened
-// lazily (rather than at package init) so importing this package never
-// touches the filesystem, only actually calling one of its functions
-// does -- e.g. `go build`/`go vet` and unit tests that don't call this
-// package still work outside of an environment with efivarfs mounted.
-var vars = efivarfs.NewFS().Open()
+// vars is the package's single efivarfs handle. Constructing it touches
+// nothing on disk: go-uefi only opens files under /sys/firmware/efi/
+// efivars when a variable is actually read or written, so importing
+// this package (e.g. for `go build`/`go vet` and unit tests of the pure
+// encoding functions below) works outside an environment with efivarfs
+// mounted.
+//
+// CheckImmutable + UnsetImmutable are load-bearing for re-installs. The
+// kernel marks every efivarfs file immutable (chattr +i) unless its
+// name/GUID is on a small built-in whitelist of EFI Global Variables
+// (Boot####, BootOrder, ...), to keep casual `rm -rf` from bricking
+// firmware. LoaderEntryDefault lives under systemd-boot's vendor GUID,
+// so the file the first install creates comes back immutable, and any
+// later open for write fails with EPERM. Creating a variable that
+// doesn't exist yet bypasses that check, which is why a first install
+// on fresh NVRAM works and only the second install on the same firmware
+// fails. With both flags set, go-uefi checks for and clears the
+// immutable bit before every write, the same thing efibootmgr and
+// bootctl do.
+var vars = efivarfs.NewFS().CheckImmutable().UnsetImmutable().Open()
 
 // utf16z is a NUL-terminated UTF-16LE string, the wire format most
 // boot-loader-interface variables use. efivar.Efistring already decodes
@@ -180,39 +206,143 @@ func buildLoadOption(label string, partNumber uint32, partGUID uuid.UUID, firstL
 	return loadOption.Bytes()
 }
 
-// parseBootNum extracts the numeric part of a "Boot####" name, as
-// returned by (*efivarfs.Efivarfs).GetBootOrder.
-func parseBootNum(name string) (uint16, error) {
-	num, ok := strings.CutPrefix(name, "Boot")
-	if !ok || len(num) != 4 {
-		return 0, fmt.Errorf("efi: not a Boot#### name: %q", name)
+// loadOptionHeader is the leading, fixed part of an EFI_LOAD_OPTION
+// (UEFI spec 3.1.3): Attributes, FilePathListLength, and the
+// NUL-terminated UTF-16LE Description. It stops there -- the device
+// path list that follows is never needed on the read side (see the
+// package doc for why go-uefi's own parser of it is avoided), so it is
+// left unparsed rather than half-parsed.
+type loadOptionHeader struct {
+	Attributes         uint32
+	FilePathListLength uint16
+	Description        string
+}
+
+// Unmarshal implements efivar.Unmarshallable. Every malformed input --
+// a buffer shorter than the 6-byte fixed header, an odd number of
+// description bytes, or a description with no terminating NUL --
+// returns an error; nothing here can panic or exit on firmware-supplied
+// bytes.
+func (h *loadOptionHeader) Unmarshal(b *bytes.Buffer) error {
+	if err := binary.Read(b, binary.LittleEndian, &h.Attributes); err != nil {
+		return fmt.Errorf("efi: load option attributes: %w", err)
 	}
 
-	n, err := strconv.ParseUint(num, 16, 16)
+	if err := binary.Read(b, binary.LittleEndian, &h.FilePathListLength); err != nil {
+		return fmt.Errorf("efi: load option file path list length: %w", err)
+	}
 
-	return uint16(n), err
+	desc, err := decodeUTF16Z(b.Bytes())
+	if err != nil {
+		return fmt.Errorf("efi: load option description: %w", err)
+	}
+
+	h.Description = desc
+
+	return nil
+}
+
+// decodeUTF16Z decodes the leading NUL-terminated UTF-16LE string in b
+// and returns it, ignoring whatever follows the terminator. It is the
+// read-side counterpart of utf16z: a strict decoder that errors on an
+// odd byte count or a missing terminator rather than assuming either.
+func decodeUTF16Z(b []byte) (string, error) {
+	var units []uint16
+
+	for i := 0; ; i += 2 {
+		if i+2 > len(b) {
+			return "", errors.New("no NUL terminator")
+		}
+
+		u := binary.LittleEndian.Uint16(b[i:])
+		if u == 0 {
+			return string(utf16.Decode(units)), nil
+		}
+
+		units = append(units, u)
+	}
+}
+
+// bootOrder is BootOrder's wire format -- a packed little-endian
+// uint16 array of Boot#### numbers -- as an efivar.Unmarshallable, so
+// it can be read through the same GetVar path as everything else. It
+// replaces go-uefi's (*Efivarfs).GetBootOrder, which returns nil for
+// *every* failure (a transient read error included): building a new
+// order from that would silently drop every other entry the firmware
+// had.
+type bootOrder []uint16
+
+func (o *bootOrder) Unmarshal(b *bytes.Buffer) error {
+	if b.Len()%2 != 0 {
+		return fmt.Errorf("efi: BootOrder has odd length %d", b.Len())
+	}
+
+	nums := make([]uint16, 0, b.Len()/2)
+
+	for b.Len() > 0 {
+		var n uint16
+
+		_ = binary.Read(b, binary.LittleEndian, &n) // length already checked
+
+		nums = append(nums, n)
+	}
+
+	*o = nums
+
+	return nil
+}
+
+// getBootOrder reads BootOrder. Only a BootOrder that doesn't exist yet
+// (firmware with no entries at all) is treated as empty; any other
+// failure is returned, since the caller is about to rewrite the
+// variable and must not do so from a partial read.
+func getBootOrder() ([]uint16, error) {
+	var order bootOrder
+
+	err := vars.GetVar(efivar.BootOrder, &order)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("efi: read BootOrder: %w", err)
+	}
+
+	return order, nil
+}
+
+// bootEntryName formats a Boot#### variable name.
+func bootEntryName(n uint16) string {
+	return fmt.Sprintf("Boot%04X", n)
+}
+
+// bootEntryPath is the efivarfs file a Boot#### entry lives at, built
+// the same way go-uefi's fswrapper.ReadEfivarsWithGuid builds it, so
+// os.Stat here and GetVar elsewhere agree on which file they mean.
+func bootEntryPath(n uint16) string {
+	return path.Join(attributes.Efivars, fmt.Sprintf("%s-%s", bootEntryName(n), efivar.BootEntry.GUID.Format()))
 }
 
 // findByLabel returns the Boot#### number already in order whose stored
 // EFI_LOAD_OPTION description matches label, if any. Reusing that number
 // on a re-install (rather than always allocating a new one) keeps NVRAM
 // from accumulating a duplicate entry every time Install runs.
-func findByLabel(order []string, label string) (uint16, bool) {
-	for _, name := range order {
-		num, err := parseBootNum(name)
-		if err != nil {
-			continue
-		}
-
+//
+// An entry that can't be read or decoded -- missing, wrong attributes
+// (efivarfs.ErrIncorrectAttributes), or a description that doesn't
+// decode -- is simply not ours and is skipped; nothing about it needs
+// to be understood beyond "its label isn't label".
+func findByLabel(order []uint16, label string) (uint16, bool) {
+	for _, num := range order {
 		entryVar := efivar.BootEntry
-		entryVar.Name = name
+		entryVar.Name = bootEntryName(num)
 
-		var loadOption device.EFILoadOption
-		if err := vars.GetVar(entryVar, &loadOption); err != nil {
+		var hdr loadOptionHeader
+		if err := vars.GetVar(entryVar, &hdr); err != nil {
 			continue
 		}
 
-		if loadOption.Description == label {
+		if hdr.Description == label {
 			return num, true
 		}
 	}
@@ -221,15 +351,17 @@ func findByLabel(order []string, label string) (uint16, bool) {
 }
 
 // firstFreeNum returns the lowest Boot#### number that is neither in
-// order nor already present in NVRAM (probed directly, since an entry
-// can exist without being listed in BootOrder).
-func firstFreeNum(order []string) (uint16, bool) {
+// order nor already present in NVRAM. Presence is decided by whether
+// the efivarfs file exists, not by whether its contents parse: an
+// entry can exist without being listed in BootOrder, and an entry
+// this package can't decode (a vendor entry with unusual attributes,
+// say) is still an entry that must not be overwritten. Only ENOENT
+// means free; any other stat failure is returned rather than guessed
+// at.
+func firstFreeNum(order []uint16) (uint16, error) {
 	inOrder := make(map[uint16]bool, len(order))
-
-	for _, name := range order {
-		if n, err := parseBootNum(name); err == nil {
-			inOrder[n] = true
-		}
+	for _, n := range order {
+		inOrder[n] = true
 	}
 
 	for n := uint16(0); n < 0xffff; n++ {
@@ -237,18 +369,17 @@ func firstFreeNum(order []string) (uint16, bool) {
 			continue
 		}
 
-		entryVar := efivar.BootEntry
-		entryVar.Name = fmt.Sprintf("Boot%04X", n)
+		_, err := os.Stat(bootEntryPath(n))
+		if errors.Is(err, fs.ErrNotExist) {
+			return n, nil
+		}
 
-		var loadOption device.EFILoadOption
-		if err := vars.GetVar(entryVar, &loadOption); err != nil {
-			// Unreadable (almost always "does not exist") -- treat the
-			// slot as free.
-			return n, true
+		if err != nil {
+			return 0, fmt.Errorf("efi: probing %s: %w", bootEntryName(n), err)
 		}
 	}
 
-	return 0, false
+	return 0, errors.New("efi: no free Boot#### slot")
 }
 
 // setBootOrder writes BootOrder as the little-endian uint16 array the
@@ -274,18 +405,21 @@ func setBootOrder(nums []uint16) error {
 // across reinstalls) reuses the existing Boot#### number for label
 // instead of growing NVRAM with duplicate entries.
 func EnsureBootEntry(label string, partNumber uint32, partGUID uuid.UUID, firstLBA, lastLBA uint64, loaderPath string) error {
-	order := vars.GetBootOrder()
+	order, err := getBootOrder()
+	if err != nil {
+		return err
+	}
 
 	num, ok := findByLabel(order, label)
 	if !ok {
-		num, ok = firstFreeNum(order)
-		if !ok {
-			return errors.New("efi: no free Boot#### slot")
+		num, err = firstFreeNum(order)
+		if err != nil {
+			return err
 		}
 	}
 
 	entryVar := efivar.BootEntry
-	entryVar.Name = fmt.Sprintf("Boot%04X", num)
+	entryVar.Name = bootEntryName(num)
 
 	loadOption := buildLoadOption(label, partNumber, partGUID, firstLBA, lastLBA, loaderPath)
 	if err := vars.WriteVar(entryVar, rawBytes(loadOption)); err != nil {
@@ -295,12 +429,8 @@ func EnsureBootEntry(label string, partNumber uint32, partGUID uuid.UUID, firstL
 	newOrder := make([]uint16, 0, len(order)+1)
 	newOrder = append(newOrder, num)
 
-	for _, name := range order {
-		if name == entryVar.Name {
-			continue
-		}
-
-		if n, err := parseBootNum(name); err == nil {
+	for _, n := range order {
+		if n != num {
 			newOrder = append(newOrder, n)
 		}
 	}

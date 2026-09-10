@@ -84,7 +84,10 @@ func runInitialize() {
 // return on success: install.Run's own success path ends in
 // power.Do (reboot(2)), which hands control back to the firmware. Only the
 // failure path returns here, and that's fatal -- there's no disk to
-// boot from yet to fall back to.
+// boot from yet to fall back to. It is not, however, a dead end: META
+// is only initialized as Install's final step, so a power-cycle after
+// any failure lands back in Install (install.Detect still reports not
+// installed) rather than in runBoot against a half-written disk.
 func runInstall(ctx context.Context, diskPath string) {
 	if err := install.Run(ctx, diskPath); err != nil {
 		console.Fatal("[install] fatal:", err)

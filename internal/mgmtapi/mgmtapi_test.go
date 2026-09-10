@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -396,5 +397,90 @@ func TestServe_ReturnsServerFailure(t *testing.T) {
 
 	if err := newPowerServer(rejectPower).serve(context.Background(), l); err == nil {
 		t.Fatal("serve on a closed listener returned nil, want an error")
+	}
+}
+
+// TestHandleBootstrap_BodyTooLarge: the request body is capped before
+// it's decoded, so an oversized POST is rejected with 413 without the
+// handler reading it into memory or reaching bootstrapFn.
+func TestHandleBootstrap_BodyTooLarge(t *testing.T) {
+	var called bool
+
+	s := newBootstrapServer(func(context.Context, supervise.Mode) (*exec.Cmd, error) {
+		called = true
+
+		return &exec.Cmd{}, nil
+	})
+
+	// A syntactically valid object whose one string value alone is
+	// larger than the cap, so it's the size, not the JSON, that
+	// triggers the rejection.
+	body := `{"mode":"` + strings.Repeat("x", maxBodyBytes+1) + `"}`
+
+	rec := postBootstrap(t, s, body)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusRequestEntityTooLarge, rec.Body.String())
+	}
+
+	if called {
+		t.Fatal("bootstrapFn was called for an oversized request")
+	}
+
+	if msg := decodeError(t, rec); !strings.Contains(msg, "exceeds") {
+		t.Fatalf("error = %q, want a body-size message", msg)
+	}
+}
+
+// TestServe_ClosesIdleConnectionBeforeHeaders is the slowloris case: a
+// client that connects and never sends a request line must be
+// disconnected by the server once readHeaderTimeout elapses, rather
+// than holding a goroutine and fd open for as long as it likes.
+func TestServe_ClosesIdleConnectionBeforeHeaders(t *testing.T) {
+	// Shorten the header timeout for the test. http.Server sets the
+	// read deadline for the request line and headers from
+	// ReadHeaderTimeout alone (ReadTimeout only bounds the whole
+	// request), so it's the only one that matters here.
+	orig := readHeaderTimeout
+	readHeaderTimeout = 200 * time.Millisecond
+
+	t.Cleanup(func() { readHeaderTimeout = orig })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening: %v", err)
+	}
+
+	served := make(chan error, 1)
+	go func() { served <- newPowerServer(rejectPower).serve(ctx, l) }()
+
+	conn, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatalf("dialing: %v", err)
+	}
+	defer conn.Close() //nolint:errcheck
+
+	// Send nothing. The server should close the connection on its
+	// own; a read then returns EOF (or a reset). If it never does, the
+	// deadline below turns the hang into a failure.
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("setting read deadline: %v", err)
+	}
+
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("read returned data on a connection that sent no request")
+	} else if errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal("server did not close an idle connection within the header timeout")
+	}
+
+	cancel()
+
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve did not return after ctx was canceled")
 	}
 }

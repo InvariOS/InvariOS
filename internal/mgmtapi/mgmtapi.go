@@ -29,6 +29,34 @@ import (
 // connections (e.g. an OCI registry pull) get auto-assigned.
 const Addr = "0.0.0.0:8420"
 
+// maxBodyBytes caps how much of a request body a handler will read.
+// The only body this API accepts is /bootstrap's few-field JSON object,
+// so 4 KiB is generous. Without a cap, json.Decoder reads whatever the
+// client sends into PID 1's heap: one unauthenticated multi-gigabyte
+// POST is enough to have the OOM killer take out bao (it won't kill
+// init) or the Go runtime abort, which for PID 1 is a kernel panic.
+const maxBodyBytes = 4096
+
+// Server timeouts. All three are vars rather than consts only so tests
+// can shorten them; production never changes them.
+//
+// This API is reachable by anyone on the network and has no auth yet,
+// so a client that opens a connection and then sends nothing (or
+// trickles a header one byte at a time) must not be able to hold a
+// goroutine and a file descriptor open indefinitely. readHeaderTimeout
+// bounds the wait for a complete request line and headers; readTimeout
+// bounds the whole request including the (already capped) body;
+// idleTimeout bounds how long a keep-alive connection sits between
+// requests. There is deliberately no WriteTimeout: /bootstrap's
+// response waits on the workload actually starting, and cutting that
+// off at an arbitrary point would report failure for a bootstrap that
+// then succeeds.
+var (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 10 * time.Second
+	idleTimeout       = 60 * time.Second
+)
+
 // drainTimeout bounds how long ListenAndServe waits for in-flight
 // requests to finish once its ctx is canceled. The only caller that
 // cancels it is the power sequence in cmd/root.go, right after a
@@ -88,7 +116,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // serve is separate from ListenAndServe so tests can bind an ephemeral
 // port instead of the fixed Addr.
 func (s *Server) serve(ctx context.Context, l net.Listener) error {
-	srv := &http.Server{Handler: s.mux()}
+	srv := &http.Server{
+		Handler:           s.mux(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
+	}
 
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(l) }()
@@ -156,8 +189,19 @@ type errorResponse struct {
 // or a repeat is bootstrapFn's decision (ErrAlreadyBootstrapped below),
 // not something this handler tracks.
 func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
+	// MaxBytesReader also tells the server to close the connection
+	// once the limit is hit, so an oversized body isn't drained either.
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
 	var req bootstrapRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes))
+
+			return
+		}
+
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("decoding request body: %v", err))
 
 		return
