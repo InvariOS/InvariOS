@@ -36,10 +36,12 @@ type Supervisor struct {
 	bootstrapFn BootstrapFunc
 	persistFn   PersistFunc
 	requests    chan bootstrapRequest
+	stops       chan stopRequest
 
-	// bootstrapped and cmd are only ever read or written from Run's
-	// goroutine.
+	// bootstrapped, stopping, and cmd are only ever read or written
+	// from Run's goroutine.
 	bootstrapped bool
+	stopping     bool
 	cmd          *exec.Cmd
 }
 
@@ -54,17 +56,20 @@ func NewSupervisor(bootstrapFn BootstrapFunc, persistFn PersistFunc) *Supervisor
 		bootstrapFn: bootstrapFn,
 		persistFn:   persistFn,
 		requests:    make(chan bootstrapRequest),
+		stops:       make(chan stopRequest),
 	}
 }
 
 // Run is the supervisor's loop: the only goroutine that ever reads or
-// writes m's bootstrapped/cmd state. It returns when ctx is canceled --
-// callers run it in its own goroutine and rely on that cancellation for
-// shutdown, since it otherwise never returns on its own.
+// writes m's bootstrapped/stopping/cmd state. It returns when ctx is
+// canceled -- callers run it in its own goroutine, and in production
+// that ctx is never canceled: taking the node down goes through Stop
+// (which leaves Run running, refusing further bootstraps) and then
+// reboot(2), not through this loop exiting.
 //
-// Reaping the started process if it exits, restarting it, and reacting
-// to reboot/shutdown requests are not implemented here yet -- this loop
-// only ever handles bootstrap requests today.
+// It handles bootstrap requests (Bootstrap) and stop requests (Stop).
+// Reaping the started process if it exits on its own, and restarting
+// it, are not implemented here yet.
 func (m *Supervisor) Run(ctx context.Context) {
 	for {
 		select {
@@ -72,15 +77,21 @@ func (m *Supervisor) Run(ctx context.Context) {
 			return
 		case req := <-m.requests:
 			req.reply <- m.bootstrap(ctx, req.mode)
+		case req := <-m.stops:
+			req.reply <- m.stop(req.ctx)
 		}
 	}
 }
 
-// bootstrap is Run's own bootstrap step: reject the request if
-// bootstrapped is already set, otherwise persist mode and only then
-// start the workload. It lives here, rather than in a caller like
-// mgmtapi, because bootstrapped and cmd are only safe to read or write
-// from Run's goroutine.
+// bootstrap is Run's own bootstrap step: reject the request if the
+// node is stopping or bootstrapped is already set, otherwise persist
+// mode and only then start the workload. It lives here, rather than in
+// a caller like mgmtapi, because bootstrapped and cmd are only safe to
+// read or write from Run's goroutine.
+//
+// The stopping check comes before the bootstrapped one so a caller
+// racing a shutdown gets the more useful answer -- the node is going
+// down, rather than merely already bootstrapped.
 //
 // Persisting comes first, before bootstrapFn ever runs: a workload this
 // node can't durably remember choosing isn't safe to start in the first
@@ -90,6 +101,10 @@ func (m *Supervisor) Run(ctx context.Context) {
 // failure) is harmless -- it's the same value PersistMode already
 // wrote.
 func (m *Supervisor) bootstrap(ctx context.Context, mode Mode) bootstrapResult {
+	if m.stopping {
+		return bootstrapResult{err: ErrStopping}
+	}
+
 	if m.bootstrapped {
 		return bootstrapResult{err: ErrAlreadyBootstrapped}
 	}

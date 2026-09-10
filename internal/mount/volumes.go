@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -33,6 +34,59 @@ func Volumes(diskPath string) error {
 	}
 
 	return mountXFS(diskPath, layout.Data.Number, paths.DataDir)
+}
+
+// UnmountVolumes unmounts DATA and STATE, in the reverse of the order
+// Volumes mounted them, so a reboot or power-off finds both XFS
+// filesystems cleanly closed (unmount record written, no log replay on
+// the next mount). It is only correct to call once nothing is using
+// them: the supervised workload has been stopped and reaped, and PID 1
+// itself holds no open files under either.
+//
+// A mount that's still busy is remounted read-only instead, the same
+// fallback sysvinit and systemd use at shutdown: it can't detach the
+// mount, but it does force the filesystem's log clean and stop any
+// further writes, which is what actually matters before reboot(2). A
+// lazy unmount (MNT_DETACH) is deliberately not used -- it only removes
+// the name from the tree and quiesces nothing.
+//
+// Every failure (including a successful read-only fallback, since that
+// still means something was holding the volume) is collected and
+// returned rather than stopping at the first. Callers are expected to
+// log it and carry on to sync and reboot regardless: refusing to power
+// off a machine an operator asked to power off, over a volume the
+// kernel will replay the journal for next boot anyway, is the worse
+// outcome.
+func UnmountVolumes() error {
+	var errs []error
+
+	for _, target := range []string{paths.DataDir, paths.StateDir} {
+		if err := unmountOrRemountReadOnly(target); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// unmountOrRemountReadOnly unmounts target, falling back to a read-only
+// remount if it's busy (see UnmountVolumes). The remount keeps NoExec
+// so the fallback never loosens the flags Volumes mounted with.
+func unmountOrRemountReadOnly(target string) error {
+	err := unix.Unmount(target, 0)
+	if err == nil {
+		return nil
+	}
+
+	if !errors.Is(err, unix.EBUSY) {
+		return fmt.Errorf("unmounting %s: %w", target, err)
+	}
+
+	if rerr := unix.Mount("", target, "", unix.MS_REMOUNT|unix.MS_RDONLY|NoExec, ""); rerr != nil {
+		return fmt.Errorf("unmounting %s: %w; remounting read-only: %w", target, err, rerr)
+	}
+
+	return fmt.Errorf("unmounting %s: %w (remounted read-only instead)", target, err)
 }
 
 // mountXFS mounts partition number of diskPath (an XFS filesystem
