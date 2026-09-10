@@ -20,7 +20,7 @@ jobs:
         with:
           fetch-depth: 0 # full history + tags, needed by cmd/build.go's `git describe`
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -64,7 +64,7 @@ jobs:
           echo "iso=out/invarios-${version}-amd64.iso" >> "$GITHUB_OUTPUT"
           echo "img=out/invarios-${version}-amd64-efi.img" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: invarios-amd64
           path: |
